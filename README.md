@@ -80,9 +80,9 @@ SAM-Audio supports three types of prompts:
 
 See the [examples](examples) directory for more detailed examples
 
-### Span Prediction
+### Span Prediction (Optional for Text Prompting)
 
-We also provide support for automatically predicting the spans based on the text description.  You can enable this by adding `predict_spans=True` in your call to `separate`
+We also provide support for automatically predicting the spans based on the text description, which is especially helpful for separating non-ambience sound events.  You can enable this by adding `predict_spans=True` in your call to `separate`
 
 ```python
 with torch.inference_mode()
