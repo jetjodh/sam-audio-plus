@@ -15,8 +15,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
+import signal
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -29,7 +31,17 @@ class GPUInfo:
 
     name: str
     vram_gb: float
+    available_vram_gb: float = 0.0
     index: int = 0
+
+
+@dataclass
+class GPUProcess:
+    """Information about a process using GPU VRAM."""
+
+    pid: int
+    name: str
+    used_memory_mb: float
 
 
 def get_gpu_info(device_index: int = 0) -> GPUInfo | None:
@@ -55,15 +67,23 @@ def get_gpu_info(device_index: int = 0) -> GPUInfo | None:
             name = name.decode("utf-8")
         mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
         vram_gb = mem_info.total / (1024**3)
+        available_vram_gb = mem_info.free / (1024**3)
         pynvml.nvmlShutdown()
-        return GPUInfo(name=name, vram_gb=vram_gb, index=device_index)
+        return GPUInfo(
+            name=name,
+            vram_gb=vram_gb,
+            available_vram_gb=available_vram_gb,
+            index=device_index,
+        )
     except Exception:
-        # Fall back to torch properties
+        # Fall back to torch properties (no available VRAM info)
         try:
             props = torch.cuda.get_device_properties(device_index)
+            total_gb = props.total_memory / (1024**3)
             return GPUInfo(
                 name=props.name,
-                vram_gb=props.total_memory / (1024**3),
+                vram_gb=total_gb,
+                available_vram_gb=total_gb,  # Assume all available as fallback
                 index=device_index,
             )
         except Exception:
@@ -109,6 +129,150 @@ def estimate_model_vram(model_size: str) -> float:
     total_gb = (model_gb * activation_multiplier) + overhead_gb
 
     return total_gb
+
+
+def get_gpu_processes(device_index: int = 0) -> list[GPUProcess]:
+    """
+    Get list of processes consuming GPU VRAM.
+
+    Args:
+        device_index: CUDA device index to query.
+
+    Returns:
+        List of GPUProcess objects, empty if unavailable.
+    """
+    processes: list[GPUProcess] = []
+
+    try:
+        import pynvml
+
+        pynvml.nvmlInit()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_index)
+
+        # Get both compute and graphics processes
+        try:
+            compute_procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+        except Exception:
+            compute_procs = []
+
+        try:
+            graphics_procs = pynvml.nvmlDeviceGetGraphicsRunningProcesses(handle)
+        except Exception:
+            graphics_procs = []
+
+        seen_pids: set[int] = set()
+        for proc in compute_procs + graphics_procs:
+            if proc.pid in seen_pids:
+                continue
+            seen_pids.add(proc.pid)
+
+            # Get process name
+            try:
+                proc_name = pynvml.nvmlSystemGetProcessName(proc.pid)
+                if isinstance(proc_name, bytes):
+                    proc_name = proc_name.decode("utf-8")
+                proc_name = os.path.basename(proc_name)
+            except Exception:
+                proc_name = f"PID {proc.pid}"
+
+            used_mb = (proc.usedGpuMemory or 0) / (1024**2)
+            processes.append(GPUProcess(pid=proc.pid, name=proc_name, used_memory_mb=used_mb))
+
+        pynvml.nvmlShutdown()
+    except Exception:
+        pass
+
+    return sorted(processes, key=lambda p: p.used_memory_mb, reverse=True)
+
+
+def display_gpu_info(gpu_info: GPUInfo, processes: list[GPUProcess]) -> None:
+    """
+    Display GPU VRAM information and process list.
+
+    Args:
+        gpu_info: GPU information object.
+        processes: List of processes using GPU VRAM.
+    """
+    used_gb = gpu_info.vram_gb - gpu_info.available_vram_gb
+    usage_pct = (used_gb / gpu_info.vram_gb) * 100 if gpu_info.vram_gb > 0 else 0
+
+    print(f"\n{'=' * 60}")
+    print(f"GPU: {gpu_info.name}")
+    print(f"{'=' * 60}")
+    print(f"  Total VRAM:     {gpu_info.vram_gb:6.2f} GB")
+    print(f"  Available VRAM: {gpu_info.available_vram_gb:6.2f} GB")
+    print(f"  Used VRAM:      {used_gb:6.2f} GB ({usage_pct:.1f}%)")
+
+    if processes:
+        print(f"\n  {'PID':<10} {'Process':<30} {'Memory (MB)':>12}")
+        print(f"  {'-' * 10} {'-' * 30} {'-' * 12}")
+        for proc in processes:
+            print(f"  {proc.pid:<10} {proc.name:<30} {proc.used_memory_mb:>12.1f}")
+    else:
+        print("\n  No GPU processes detected.")
+    print(f"{'=' * 60}\n")
+
+
+def prompt_process_termination(processes: list[GPUProcess]) -> bool:
+    """
+    Prompt user to optionally terminate VRAM-consuming processes.
+
+    Args:
+        processes: List of processes that could be terminated.
+
+    Returns:
+        True if any process was terminated, False otherwise.
+    """
+    if not processes:
+        return False
+
+    # Filter out current process
+    current_pid = os.getpid()
+    killable = [p for p in processes if p.pid != current_pid]
+
+    if not killable:
+        return False
+
+    print("Would you like to terminate any processes to free up VRAM?")
+    print("Enter PID(s) separated by commas, or press Enter to skip: ", end="")
+
+    try:
+        user_input = input().strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+
+    if not user_input:
+        return False
+
+    terminated = False
+    pids_to_kill = [p.strip() for p in user_input.split(",") if p.strip()]
+
+    for pid_str in pids_to_kill:
+        try:
+            pid = int(pid_str)
+            if pid == current_pid:
+                print(f"  Cannot terminate current process (PID {pid})")
+                continue
+
+            # Check if PID is in our known processes
+            if not any(p.pid == pid for p in killable):
+                print(f"  PID {pid} not found in GPU process list")
+                continue
+
+            os.kill(pid, signal.SIGTERM)
+            print(f"  Sent SIGTERM to PID {pid}")
+            terminated = True
+        except ValueError:
+            print(f"  Invalid PID: {pid_str}")
+        except ProcessLookupError:
+            print(f"  Process {pid_str} not found")
+        except PermissionError:
+            print(f"  Permission denied to terminate PID {pid_str}")
+        except Exception as e:
+            print(f"  Error terminating PID {pid_str}: {e}")
+
+    return terminated
 
 
 def select_model(gpu_info: GPUInfo | None, safety_margin: float = 0.9) -> str:
@@ -239,6 +403,11 @@ Examples:
         action="store_true",
         help="Print detailed information.",
     )
+    parser.add_argument(
+        "-n", "--no-interactive",
+        action="store_true",
+        help="Skip interactive prompts (e.g., process termination).",
+    )
 
     args = parser.parse_args()
 
@@ -253,12 +422,25 @@ Examples:
     output_target = args.output or parent / f"{stem}_target.wav"
     output_residual = args.residual or parent / f"{stem}_residual.wav"
 
-    # Detect GPU
+    # Detect GPU and display info
     gpu_info = get_gpu_info()
-    if args.verbose:
-        if gpu_info:
-            print(f"Detected GPU: {gpu_info.name} ({gpu_info.vram_gb:.1f}GB VRAM)")
-        else:
+    if gpu_info:
+        processes = get_gpu_processes(gpu_info.index)
+        display_gpu_info(gpu_info, processes)
+
+        # Offer to terminate processes if VRAM is low and interactive mode
+        if not args.no_interactive and processes:
+            used_gb = gpu_info.vram_gb - gpu_info.available_vram_gb
+            if used_gb > 1.0:  # More than 1GB used
+                if prompt_process_termination(processes):
+                    # Re-query GPU info after termination
+                    import time
+                    time.sleep(1)  # Brief pause for cleanup
+                    gpu_info = get_gpu_info()
+                    if gpu_info:
+                        print(f"Updated available VRAM: {gpu_info.available_vram_gb:.2f} GB")
+    else:
+        if args.verbose:
             print("No GPU detected, using CPU")
 
     # Select model
