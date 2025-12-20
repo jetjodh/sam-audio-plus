@@ -30,6 +30,23 @@ warnings.filterwarnings("ignore", category=FutureWarning, message="The pynvml pa
 warnings.filterwarnings("ignore", category=FutureWarning, message="Importing from timm.models.layers is deprecated")
 warnings.filterwarnings("ignore", category=UserWarning, message="torch.meshgrid: in an upcoming release")
 
+# Suppress torch.compile and CUDA warnings (Issue #20)
+# 1. dtype mismatch in LayerNorm when input is fp16 and weights are fp32
+warnings.filterwarnings("ignore", category=UserWarning, message="Mismatch dtype between input and weight")
+# 2. SM count warning when GPU lacks enough multiprocessors for max_autotune
+warnings.filterwarnings("ignore", message="Not enough SMs to use max_autotune_gemm mode")
+# 3. CUDAGraph fast path warning during warmup before inference_mode is active
+warnings.filterwarnings("ignore", category=UserWarning, message="Unable to hit fast path of CUDAGraphs")
+# 4. Online softmax warning from torch._inductor when splitting reduction
+warnings.filterwarnings("ignore", category=UserWarning, message="Online softmax is disabled")
+# 5. RobertaModel pooler weights re-initialization (expected for CLAP)
+warnings.filterwarnings("ignore", message=".*RobertaModel.*not initialized.*")
+
+# Suppress torch inductor/dynamo logging (uses logging, not warnings)
+# Must be set before importing torch
+os.environ.setdefault("TORCH_LOGS", "-inductor,-dynamo")
+os.environ.setdefault("TORCHINDUCTOR_LOG_LEVEL", "ERROR")
+
 import torch
 import torchaudio
 
