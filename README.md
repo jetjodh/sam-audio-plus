@@ -84,6 +84,33 @@ uv run sam-audio --help
 #   -v, --verbose       Show detailed progress
 ```
 
+### Performance Metrics
+
+SAM-Audio includes a comprehensive metrics system to track execution time, minimal VRAM usage, and GPU utilization.
+
+- **Automatic Reporting**: A summary table is printed after each run.
+- **JSON Export**: Save metrics to a JSON file using `--metrics-json <path>` (or auto-generated in `logs/metrics/` if logging is enabled).
+- **Control**: Disable metrics with `--no-metrics` or `SAM_AUDIO_METRICS=0`.
+
+Example report:
+```text
+============================================================
+                  PERFORMANCE METRICS REPORT
+============================================================
+ TIMING
+Metric                         |       Last |       Mean |      Total
+------------------------------------------------------------------
+model_loading_time             |      1.23s |      1.23s |      1.23s
+separation_process_time        |      2.45s |      2.45s |      2.45s
+total_execution_time           |      3.78s |      3.78s |      3.78s
+
+ MEMORY (VRAM)
+Metric                         |       Peak |        Ave |       Last
+------------------------------------------------------------------
+pre_separation_vram_allocated  |      2.50GB |     2.50GB |     2.50GB
+...
+```
+
 ## Python API
 
 For programmatic usage, import SAM-Audio directly:

@@ -604,9 +604,17 @@ Examples:
         print("Loading model...")
     logger.info("Loading model from %s", model_path)
     flush_output()
-    model = SAMAudio.from_pretrained(model_path)
-    model = model.eval()
-    model = model.to(device)
+    
+    # Log VRAM before loading
+    from sam_audio.metrics import measure_time, log_memory
+    log_memory("pre_load_vram", device)
+
+    with measure_time("model_loading_time"):
+        model = SAMAudio.from_pretrained(model_path)
+        model = model.eval()
+        model = model.to(device)
+    
+    log_memory("post_load_vram", device)
 
     processor = SAMAudioProcessor.from_pretrained(model_path)
 
@@ -626,12 +634,18 @@ Examples:
     # Run separation
     logger.info("Running audio separation (predict_spans=%s, candidates=%d)", args.predict_spans, candidates)
     flush_output()
-    with torch.inference_mode():
-        result = model.separate(
-            batch,
-            predict_spans=args.predict_spans,
-            reranking_candidates=candidates,
-        )
+    
+    log_memory("pre_separation_vram", device)
+    
+    with measure_time("separation_process_time"):
+        with torch.inference_mode():
+            result = model.separate(
+                batch,
+                predict_spans=args.predict_spans,
+                reranking_candidates=candidates,
+            )
+            
+    log_memory("post_separation_vram", device)
     logger.info("Separation complete")
     flush_output()
 
