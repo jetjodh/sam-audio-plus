@@ -11,6 +11,8 @@ from huggingface_hub import ModelHubMixin, snapshot_download
 
 from sam_audio.logging_config import LogContext, flush_output, get_logger
 from sam_audio.runtime import auto_tune, compile_model, get_default_device, should_compile
+from transformers import BitsAndBytesConfig
+
 
 logger = get_logger(__name__)
 
@@ -35,8 +37,18 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
         map_location: str = "cpu",
         strict: bool = True,
         revision: Optional[str] = None,
+        load_in_8bit: bool = False,
+        load_in_4bit: bool = False,
         **model_kwargs,
     ):
+        quantization_config = None
+        if load_in_8bit or load_in_4bit:
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=load_in_8bit,
+                load_in_4bit=load_in_4bit,
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+
         auto_device = os.environ.get("SAM_AUDIO_AUTO_DEVICE", "1") != "0"
         requested_device = os.environ.get("SAM_AUDIO_DEVICE")
         if requested_device is not None:
@@ -102,6 +114,10 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
         for key, value in model_kwargs.items():
             if key in config:
                 config[key] = value
+
+        if quantization_config:
+            config["quantization_config"] = quantization_config
+
 
         logger.info("Instantiating model modules for %s", model_id)
         flush_output()
@@ -213,7 +229,8 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
                 t0 = time.perf_counter()
                 model.transformer = compile_model(
                     model.transformer,
-                    mode="reduce-overhead",
+
+                    mode=None, # Use default from env var
                     fullgraph=True,
                     dynamic=False,  # Use static shapes for better optimization
                 )

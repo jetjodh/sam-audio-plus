@@ -31,6 +31,8 @@ dependencies = [
     "torchdiffeq>=0.2.5",
     "torchvision>=0.20.0",
     "transformers>=4.47.0",
+    "bitsandbytes>=0.41.0",
+    "accelerate>=0.26.0",
 ]
 
 [project.scripts]

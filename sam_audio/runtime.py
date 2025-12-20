@@ -42,10 +42,14 @@ def should_compile() -> bool:
     return _env_truthy("SAM_AUDIO_COMPILE", default=True)
 
 
+def get_compile_mode() -> str:
+    return os.environ.get("SAM_AUDIO_COMPILE_MODE", "reduce-overhead")
+
+
 def compile_model(
     model: torch.nn.Module,
     *,
-    mode: str = "reduce-overhead",
+    mode: str = None,
     fullgraph: bool = False,
     dynamic: bool = True,
 ) -> torch.nn.Module:
@@ -63,6 +67,9 @@ def compile_model(
     """
     if not should_compile():
         return model
+
+    if mode is None:
+        mode = get_compile_mode()
 
     try:
         return torch.compile(

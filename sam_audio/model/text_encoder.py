@@ -19,7 +19,11 @@ class T5TextEncoder(torch.nn.Module):
 
     def __init__(self, cfg: T5EncoderConfig):
         super().__init__()
-        self.model = transformers.T5EncoderModel.from_pretrained(cfg.name)
+        quantization_config = getattr(cfg, "quantization_config", None)
+        self.model = transformers.T5EncoderModel.from_pretrained(
+            cfg.name,
+            quantization_config=quantization_config,
+        )
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(cfg.name)
         self.pad_mode = cfg.pad_mode
         self.max_length = cfg.max_length

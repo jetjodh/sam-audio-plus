@@ -34,21 +34,24 @@ def get_nonlinearity(kind: str):
     }[kind]
 
 
-class RMSNorm(torch.nn.Module):
-    """Root Mean Square Layer Normalization with torch.compile-friendly ops."""
+try:
+    from torch.nn import RMSNorm
+except ImportError:
+    class RMSNorm(torch.nn.Module):
+        """Root Mean Square Layer Normalization with torch.compile-friendly ops."""
 
-    def __init__(self, dim: int, eps: float = 1e-5):
-        super().__init__()
-        self.eps = eps
-        self.weight = torch.nn.Parameter(torch.ones(dim))
+        def __init__(self, dim: int, eps: float = 1e-5):
+            super().__init__()
+            self.eps = eps
+            self.weight = torch.nn.Parameter(torch.ones(dim))
 
-    def _norm(self, x):
-        # Use torch.mean for better kernel fusion with torch.compile
-        return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
+        def _norm(self, x):
+            # Use torch.mean for better kernel fusion with torch.compile
+            return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
 
-    def forward(self, x):
-        output = self._norm(x.float())
-        return (output * self.weight).type_as(x)
+        def forward(self, x):
+            output = self._norm(x.float())
+            return (output * self.weight).type_as(x)
 
 
 class ProjectionLayer(torch.nn.Module):

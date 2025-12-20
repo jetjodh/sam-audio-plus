@@ -552,6 +552,17 @@ Examples:
         help="Amount of VRAM (GB) to leave free for desktop responsiveness (default: 1.0).",
     )
     parser.add_argument(
+        "--load-8bit",
+        action="store_true",
+        help="Load model in 8-bit quantization (reduces VRAM, requires bitsandbytes).",
+    )
+    parser.add_argument(
+        "--load-4bit",
+        action="store_true",
+        help="Load model in 4-bit quantization (reduces VRAM, requires bitsandbytes).",
+    )
+
+    parser.add_argument(
         "--metrics-json",
         type=Path,
         default=None,
@@ -670,7 +681,12 @@ Examples:
     log_memory("pre_load_vram", device)
 
     with measure_time("model_loading_time"):
-        model = SAMAudio.from_pretrained(model_path)
+        model = SAMAudio.from_pretrained(
+            model_path,
+            load_in_8bit=args.load_8bit,
+            load_in_4bit=args.load_4bit,
+        )
+
         model = model.eval()
         model = model.to(device)
     

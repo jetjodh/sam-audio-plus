@@ -53,11 +53,14 @@ class T5EncoderConfig(TextEncoderConfig):
         max_length: Optional[int] = 512,
         pad_mode: str = "longest",
         dim: int = 768,
+        quantization_config=None,
     ):
         super().__init__(dim=dim)
         self.name = name
         self.max_length = max_length
         self.pad_mode = pad_mode
+        self.quantization_config = quantization_config
+
 
 
 class VisionEncoderConfig:
@@ -214,10 +217,18 @@ class SAMAudioConfig:
         visual_ranker=None,
         text_ranker=None,
         span_predictor: Optional[str] = "pe-a-frame-large",
+        quantization_config=None,
     ):
         self.in_channels = in_channels
         self.audio_codec = DACVAEConfig(**(audio_codec or {}))
-        self.text_encoder = T5EncoderConfig(**(text_encoder or {}))
+        
+        # Propagate quantization to text encoder
+        text_encoder_args = text_encoder or {}
+        if quantization_config is not None:
+             text_encoder_args["quantization_config"] = quantization_config
+             
+        self.text_encoder = T5EncoderConfig(**text_encoder_args)
+
         self.vision_encoder = PerceptionEncoderConfig(**(vision_encoder or {}))
         self.transformer = TransformerConfig(**(transformer or {}))
         self.num_anchors = num_anchors
@@ -229,6 +240,8 @@ class SAMAudioConfig:
             None if text_ranker is None else parse_ranker_config(text_ranker)
         )
         self.span_predictor = span_predictor
+        self.quantization_config = quantization_config
+
 
 
 class SAMAudioJudgeConfig:
