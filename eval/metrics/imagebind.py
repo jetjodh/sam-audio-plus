@@ -6,6 +6,7 @@ import torch
 from imagebind.models.imagebind_model import ModalityType, imagebind_huge
 
 from sam_audio.ranking.imagebind import VideoTransform, load_and_transform_audio_data
+from sam_audio.runtime import auto_tune
 
 
 class ImageBind(torch.nn.Module):
@@ -18,12 +19,13 @@ class ImageBind(torch.nn.Module):
 
         self.model = imagebind_huge(pretrained=checkpoint is None)
         if checkpoint is not None:
-            self.model.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+            self.model.load_state_dict(
+                torch.load(checkpoint, map_location="cpu"))
         self.model = self.model.eval()
         self.video_transform = VideoTransform()
-        self.device = device or torch.device(
+        self.device = auto_tune(device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        ))
         self.model = self.model.to(self.device)
 
     def __call__(
@@ -39,7 +41,8 @@ class ImageBind(torch.nn.Module):
         durations = [x.size(-1) / target_wavs_sample_rate for x in target_wavs]
         video_data = self.video_transform(videos, durations, audio_data.device)
 
-        inputs = {ModalityType.AUDIO: audio_data, ModalityType.VISION: video_data}
+        inputs = {ModalityType.AUDIO: audio_data,
+                  ModalityType.VISION: video_data}
         embs = self.model(inputs)
         audio_embs, video_embs = embs[ModalityType.AUDIO], embs[ModalityType.VISION]
         audio_embs, video_embs = (
@@ -48,5 +51,6 @@ class ImageBind(torch.nn.Module):
         )
         bsz = len(target_wavs)
         candidates = len(audio_embs) // bsz
-        scores = audio_embs.view(bsz, candidates, -1) @ video_embs.view(bsz, -1, 1)
+        scores = audio_embs.view(
+            bsz, candidates, -1) @ video_embs.view(bsz, -1, 1)
         return {"ImageBind": scores.squeeze(1, 2).cpu().tolist()}

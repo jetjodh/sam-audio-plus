@@ -9,6 +9,7 @@ import torch
 from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
 from torchdiffeq import odeint
 
+from sam_audio.runtime import autocast_context
 from sam_audio.model.align import AlignModalities
 from sam_audio.model.base import BaseModel
 from sam_audio.model.codec import DACVAE
@@ -80,7 +81,9 @@ class SAMAudio(BaseModel):
         super().__init__()
         self.audio_codec = DACVAE(cfg.audio_codec)
         self.text_encoder = T5TextEncoder(cfg.text_encoder)
-        self.vision_encoder = PerceptionEncoder(cfg.vision_encoder)
+        self._vision_encoder_cfg = cfg.vision_encoder
+        self._vision_dim = cfg.vision_encoder.dim
+        self.vision_encoder = None
         self.transformer = DiT(cfg.transformer)
         self.proj = torch.nn.Linear(cfg.in_channels, cfg.transformer.dim)
         self.align_masked_video = AlignModalities(
@@ -89,17 +92,43 @@ class SAMAudio(BaseModel):
         self.embed_anchors = EmbedAnchors(
             cfg.num_anchors, cfg.anchor_embedding_dim, cfg.transformer.dim
         )
-        self.memory_proj = torch.nn.Linear(cfg.text_encoder.dim, cfg.transformer.dim)
+        self.memory_proj = torch.nn.Linear(
+            cfg.text_encoder.dim, cfg.transformer.dim)
         self.timestep_emb = SinusoidalEmbedding(cfg.transformer.dim)
-        self.visual_ranker = create_ranker(cfg.visual_ranker)
-        self.text_ranker = create_ranker(cfg.text_ranker)
-        if cfg.span_predictor is not None:
+        self._visual_ranker_cfg = cfg.visual_ranker
+        self._text_ranker_cfg = cfg.text_ranker
+        self.visual_ranker = None
+        self.text_ranker = None
+        self._span_predictor_cfg = cfg.span_predictor
+        self.span_predictor = None
+        self.span_predictor_transform = None
+
+    def _get_vision_encoder(self):
+        if self.vision_encoder is None:
+            self.vision_encoder = PerceptionEncoder(self._vision_encoder_cfg)
+        return self.vision_encoder
+
+    def _get_span_predictor(self):
+        if self._span_predictor_cfg is None:
+            return None
+        if self.span_predictor is None:
             self.span_predictor = PEAudioFrame.from_config(
-                cfg.span_predictor, pretrained=True
+                self._span_predictor_cfg, pretrained=True
             )
             self.span_predictor_transform = PEAudioFrameTransform.from_config(
-                cfg.span_predictor
+                self._span_predictor_cfg
             )
+        return self.span_predictor
+
+    def _get_visual_ranker(self):
+        if self.visual_ranker is None and self._visual_ranker_cfg is not None:
+            self.visual_ranker = create_ranker(self._visual_ranker_cfg)
+        return self.visual_ranker
+
+    def _get_text_ranker(self):
+        if self.text_ranker is None and self._text_ranker_cfg is not None:
+            self.text_ranker = create_ranker(self._text_ranker_cfg)
+        return self.text_ranker
 
     @property
     def sample_rate(self):
@@ -186,9 +215,9 @@ class SAMAudio(BaseModel):
     def _get_video_features(self, video, audio_features):
         B, T, _ = audio_features.shape
         if video is None:
-            return audio_features.new_zeros(B, self.vision_encoder.dim, T)
+            return audio_features.new_zeros(B, self._vision_dim, T)
         else:
-            return self.vision_encoder(video).transpose(1, 2)
+            return self._get_vision_encoder()(video).transpose(1, 2)
 
     def _repeat_for_reranking(self, tensor, candidates):
         if candidates > 1:
@@ -240,7 +269,8 @@ class SAMAudio(BaseModel):
             return_spans=True,
             **input,
         )
-        anchors = [[["+"] + anchor for anchor in anchors] for anchors in output.spans]
+        anchors = [[["+"] + anchor for anchor in anchors]
+                   for anchors in output.spans]
         batch.process_anchors(anchors)
         return batch
 
@@ -253,10 +283,38 @@ class SAMAudio(BaseModel):
         reranking_candidates: int = 1,
         predict_spans: bool = False,
     ) -> SeparationResult:
-        # Encode audio
-        forward_args = self._get_forward_args(batch, candidates=reranking_candidates)
+        device = batch.audios.device
+        # Encode audio/text/video (keep state tensors float32; AMP is applied in compute-heavy ops)
+        with autocast_context(device=device):
+            audio_features = self.audio_codec(batch.audios).transpose(1, 2)
+        audio_features = audio_features.float()
+        audio_features = torch.cat([audio_features, audio_features], dim=2)
 
-        if predict_spans and hasattr(self, "span_predictor") and batch.anchors is None:
+        text_features, text_mask = self.text_encoder(batch.descriptions)
+        with autocast_context(device=device):
+            masked_video_features = self._get_video_features(
+                batch.masked_video, audio_features
+            )
+        masked_video_features = masked_video_features.float()
+
+        forward_args = {
+            "audio_features": self._repeat_for_reranking(audio_features, reranking_candidates),
+            "text_features": self._repeat_for_reranking(text_features, reranking_candidates),
+            "text_mask": self._repeat_for_reranking(text_mask, reranking_candidates),
+            "masked_video_features": self._repeat_for_reranking(
+                masked_video_features, reranking_candidates
+            ),
+            "anchor_ids": self._repeat_for_reranking(batch.anchor_ids, reranking_candidates),
+            "anchor_alignment": self._repeat_for_reranking(
+                batch.anchor_alignment, reranking_candidates
+            ),
+            "audio_pad_mask": self._repeat_for_reranking(
+                batch.audio_pad_mask, reranking_candidates
+            ),
+        }
+
+        if predict_spans and batch.anchors is None and self._span_predictor_cfg is not None:
+            self._get_span_predictor()
             batch = self.predict_spans(
                 batch=batch,
                 audio_features=self._unrepeat_from_reranking(
@@ -275,11 +333,12 @@ class SAMAudio(BaseModel):
             noise = torch.randn_like(audio_features)
 
         def vector_field(t, noisy_audio):
-            res = self.forward(
-                noisy_audio=noisy_audio,
-                time=t.expand(noisy_audio.size(0)),
-                **forward_args,
-            )
+            with autocast_context(device=noisy_audio.device):
+                res = self.forward(
+                    noisy_audio=noisy_audio,
+                    time=t.expand(noisy_audio.size(0)),
+                    **forward_args,
+                )
             return res
 
         states = odeint(
@@ -290,9 +349,11 @@ class SAMAudio(BaseModel):
         )
         generated_features = states[-1].transpose(1, 2)
         # generated_features has shape [B, 2C, T].  Reshape to stack along the batch dimension
-        wavs = self.audio_codec.decode(generated_features.reshape(2 * B, C, T)).view(
-            B, 2, -1
-        )
+        with autocast_context(device=generated_features.device):
+            wavs = self.audio_codec.decode(
+                generated_features.reshape(2 * B, C, T)
+            ).view(B, 2, -1)
+        wavs = wavs.float()
 
         bsz = wavs.size(0) // reranking_candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
@@ -303,23 +364,24 @@ class SAMAudio(BaseModel):
             wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
         )
 
-        if (
-            reranking_candidates > 1
-            and batch.masked_video is not None
-            and self.visual_ranker is not None
-        ):
-            scores = self.visual_ranker(
+        if reranking_candidates > 1 and batch.masked_video is not None:
+            visual_ranker = self._get_visual_ranker()
+        else:
+            visual_ranker = None
+
+        if reranking_candidates > 1 and visual_ranker is not None:
+            scores = visual_ranker(
                 extracted_audio=target_wavs,
                 videos=batch.masked_video,
                 sample_rate=self.audio_codec.sample_rate,
             )
             idxs = scores.argmax(dim=1)
-        elif reranking_candidates > 1 and self.text_ranker is not None:
+        elif reranking_candidates > 1 and self._get_text_ranker() is not None:
             input_audio = [
                 audio[:, :size].expand(reranking_candidates, -1)
                 for audio, size in zip(batch.audios, sizes, strict=False)
             ]
-            scores = self.text_ranker(
+            scores = self._get_text_ranker()(
                 extracted_audio=target_wavs,
                 input_audio=input_audio,
                 descriptions=batch.descriptions,
@@ -330,7 +392,8 @@ class SAMAudio(BaseModel):
             idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
 
         return SeparationResult(
-            target=[wav[idx] for wav, idx in zip(target_wavs, idxs, strict=False)],
+            target=[wav[idx]
+                    for wav, idx in zip(target_wavs, idxs, strict=False)],
             residual=[
                 wavs[idx] for wavs, idx in zip(residual_wavs, idxs, strict=False)
             ],
@@ -350,9 +413,13 @@ class SAMAudio(BaseModel):
             )
             # We load this directly from HF, not in checkpoint
             skip_regex = re.compile(
-                "(^text_encoder|^visual_ranker|^text_ranker|^span_predictor)"
+                "(^text_encoder|^vision_encoder|^visual_ranker|^text_ranker|^span_predictor)"
             )
-            missing_keys = [x for x in missing_keys if not re.search(skip_regex, x)]
+            missing_keys = [
+                x for x in missing_keys if not re.search(skip_regex, x)]
+            unexpected_keys = [
+                x for x in unexpected_keys if not re.search(skip_regex, x)
+            ]
             if len(missing_keys) > 0 or len(unexpected_keys) > 0:
                 raise RuntimeError(
                     f"Missing keys: {missing_keys}, unexpected_keys: {unexpected_keys}"

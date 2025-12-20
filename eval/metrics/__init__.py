@@ -2,12 +2,18 @@
 
 from metrics.aes import Aesthetic
 from metrics.clap import CLAP
-from metrics.imagebind import ImageBind
 from metrics.judge import Judge
 
 __all__ = [
     "Aesthetic",
     "CLAP",
-    "ImageBind",
     "Judge",
 ]
+
+
+def __getattr__(name: str):
+    if name == "ImageBind":
+        from metrics.imagebind import ImageBind
+
+        return ImageBind
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

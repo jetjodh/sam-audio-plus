@@ -17,24 +17,76 @@ SAM-Audio and the Judge model crucially rely on [Perception-Encoder Audio-Visual
 ## Setup
 
 **Requirements:**
-- Python >= 3.10
+- Python >= 3.11
 - CUDA-compatible GPU (recommended)
+- [uv](https://docs.astral.sh/uv/) package manager
 
-Install dependencies:
+Install dependencies using uv:
 
 ```bash
-pip install .
+uv sync
 ```
 
-## Usage
+For development (includes Jupyter notebooks):
+
+```bash
+uv sync --group dev
+```
+
+## Quick Start: CLI
+
+The easiest way to use SAM-Audio is via the command-line interface, which automatically detects your GPU and selects the appropriate model size.
 
 ⚠️ Before using SAM Audio, please request access to the checkpoints on the SAM Audio
 Hugging Face [repo](https://huggingface.co/facebook/sam-audio-large). Once accepted, you
 need to be authenticated to download the checkpoints. You can do this by running
 the following [steps](https://huggingface.co/docs/huggingface_hub/en/quick-start#authentication)
-(e.g. `hf auth login` after generating an access token.)
+(e.g. `huggingface-cli login` after generating an access token.)
 
-### Basic Text Prompting
+### Basic Usage
+
+```bash
+# Separate a sound described by text
+uv run sam-audio --input audio.wav --description "guitar solo" --verbose
+
+# The CLI will:
+# - Detect your GPU and available VRAM
+# - Select the best model (small/base/large) for your hardware
+# - Use span prediction for better results
+# - Output target.wav and residual.wav
+```
+
+### GPU Auto-Detection
+
+The CLI dynamically estimates VRAM requirements based on model parameter counts and selects the largest model that fits in your available memory:
+
+| Model | Estimated VRAM | Parameters |
+|-------|----------------|------------|
+| `sam-audio-large` | ~6GB | ~1.2B |
+| `sam-audio-base` | ~4.5GB | ~600M |
+| `sam-audio-small` | ~3.5GB | ~300M |
+
+A 10% safety margin is applied to avoid OOM errors. Reranking candidates are also adjusted automatically.
+
+### CLI Options
+
+```bash
+uv run sam-audio --help
+
+# Key options:
+#   -i, --input         Input audio file (required)
+#   -d, --description   Sound to isolate (required)
+#   -o, --output        Output path for target audio
+#   --residual          Output path for residual audio
+#   -m, --model         Override auto-selected model
+#   -c, --candidates    Override reranking candidates
+#   --no-predict-spans  Disable span prediction
+#   -v, --verbose       Show detailed progress
+```
+
+## Python API
+
+For programmatic usage, import SAM-Audio directly:
 
 ```python
 from sam_audio import SAMAudio, SAMAudioProcessor

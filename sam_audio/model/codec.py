@@ -1,13 +1,64 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
 
+import os
 import math
 from abc import ABCMeta, abstractmethod
 from typing import Union
 
 import dacvae
 import torch
+import sys
 
 from sam_audio.model.config import DACVAEConfig
+
+
+_DACVAE_WN_PATCHED = False
+
+
+def _patch_dacvae_weight_norm() -> None:
+    global _DACVAE_WN_PATCHED
+    if _DACVAE_WN_PATCHED:
+        return
+
+    try:
+        from torch.nn.utils.parametrizations import weight_norm as _weight_norm
+    except Exception:
+        _DACVAE_WN_PATCHED = True
+        return
+
+    try:
+        import dacvae.nn.layers as _dac_layers
+
+        _dac_layers.weight_norm = _weight_norm
+    except Exception:
+        pass
+
+    _dac_discriminator = sys.modules.get("dacvae.model.discriminator")
+    if _dac_discriminator is not None:
+        try:
+            _dac_discriminator.weight_norm = _weight_norm
+        except Exception:
+            pass
+
+    try:
+        from torch.nn.utils import parametrize as _parametrize
+        from torch.nn.utils.weight_norm import (
+            remove_weight_norm as _remove_weight_norm_legacy,
+        )
+
+        def _remove_weight_norm_compat(module, name: str = "weight"):
+            if _parametrize.is_parametrized(module, name):
+                _parametrize.remove_parametrizations(
+                    module, name, leave_parametrized=True
+                )
+                return module
+            return _remove_weight_norm_legacy(module, name=name)
+
+        torch.nn.utils.remove_weight_norm = _remove_weight_norm_compat
+    except Exception:
+        pass
+
+    _DACVAE_WN_PATCHED = True
 
 
 class Encoder(torch.nn.Module, metaclass=ABCMeta):
@@ -42,6 +93,7 @@ class Codec(Encoder):
 class DACVAEEncoder(Encoder):
     def __init__(self, config: DACVAEConfig) -> None:
         super().__init__()
+        _patch_dacvae_weight_norm()
         model = dacvae.DACVAE(
             encoder_dim=config.encoder_dim,
             encoder_rates=config.encoder_rates,
@@ -63,7 +115,8 @@ class DACVAEEncoder(Encoder):
         self.quantizer = model.quantizer
 
     def forward(self, waveform: torch.Tensor) -> torch.Tensor:
-        with torch.no_grad(), torch.backends.cudnn.flags(enabled=False):
+        disable_cudnn = os.environ.get("SAM_AUDIO_DISABLE_CUDNN") == "1"
+        with torch.no_grad(), torch.backends.cudnn.flags(enabled=not disable_cudnn):
             z = self.encoder(self._pad(waveform))
             mean, _ = self.quantizer.in_proj(z).chunk(2, dim=1)
             encoded_frames = mean
@@ -84,7 +137,8 @@ class DACVAE(DACVAEEncoder, Codec):
         self.decoder = model.decoder
 
     def decode(self, encoded_frames: torch.Tensor) -> torch.Tensor:
-        with torch.backends.cudnn.flags(enabled=False):
+        disable_cudnn = os.environ.get("SAM_AUDIO_DISABLE_CUDNN") == "1"
+        with torch.backends.cudnn.flags(enabled=not disable_cudnn):
             emb = self.quantizer.out_proj(encoded_frames)
             return self.decoder(emb)
 

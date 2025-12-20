@@ -7,6 +7,7 @@ import torch
 import torchaudio
 
 from sam_audio.model.config import ImageBindRankerConfig
+from sam_audio.runtime import auto_tune
 from sam_audio.ranking.ranker import Ranker
 
 try:
@@ -68,7 +69,7 @@ def load_and_transform_audio_data(
         for clip_timepoints in all_clips_timepoints:
             waveform_clip = waveform[
                 :,
-                int(clip_timepoints[0] * sample_rate) : int(
+                int(clip_timepoints[0] * sample_rate): int(
                     clip_timepoints[1] * sample_rate
                 ),
             ]
@@ -159,9 +160,11 @@ class ImageBindRanker(Ranker):
 
         self.model = imagebind_huge(pretrained=cfg.checkpoint is None)
         if cfg.checkpoint is not None:
-            self.model.load_state_dict(torch.load(cfg.checkpoint, map_location="cpu"))
+            self.model.load_state_dict(torch.load(
+                cfg.checkpoint, map_location="cpu"))
         self.model = self.model.eval()
         self.video_transform = VideoTransform()
+        auto_tune(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
     @torch.inference_mode()
     def forward(
@@ -182,9 +185,11 @@ class ImageBindRanker(Ranker):
             video_data = load_and_transform_video_data(videos)
         else:
             durations = [x.size(-1) / sample_rate for x in extracted_audio]
-            video_data = self.video_transform(videos, durations, audio_data.device)
+            video_data = self.video_transform(
+                videos, durations, audio_data.device)
 
-        inputs = {ModalityType.AUDIO: audio_data, ModalityType.VISION: video_data}
+        inputs = {ModalityType.AUDIO: audio_data,
+                  ModalityType.VISION: video_data}
         embs = self.model(inputs)
         audio_embs, video_embs = embs[ModalityType.AUDIO], embs[ModalityType.VISION]
         audio_embs, video_embs = (
@@ -193,5 +198,6 @@ class ImageBindRanker(Ranker):
         )
         bsz = len(extracted_audio)
         candidates = len(audio_embs) // bsz
-        scores = audio_embs.view(bsz, candidates, -1) @ video_embs.view(bsz, -1, 1)
+        scores = audio_embs.view(
+            bsz, candidates, -1) @ video_embs.view(bsz, -1, 1)
         return scores

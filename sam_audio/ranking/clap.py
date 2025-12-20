@@ -5,13 +5,21 @@ import torchaudio
 from huggingface_hub import hf_hub_download
 
 from sam_audio.model.config import ClapRankerConfig
+from sam_audio.runtime import auto_tune
 from sam_audio.ranking.ranker import Ranker
 
 
 def get_model(checkpoint_file=None, device="cpu"):
     import laion_clap
 
-    model = laion_clap.CLAP_Module(enable_fusion=False, amodel="HTSAT-tiny").to(device)
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    device = auto_tune(device)
+    model = laion_clap.CLAP_Module(
+        enable_fusion=False,
+        amodel="HTSAT-tiny",
+        device=str(device),
+    ).to(device)
 
     if checkpoint_file is None:
         checkpoint_file = hf_hub_download(
@@ -77,7 +85,8 @@ class ClapRanker(Ranker):
         audio_embed = self.model.model.get_audio_embedding(
             self._prepare_audio(extracted_audio, sample_rate)
         )
-        text_embed = self.model.get_text_embedding(descriptions, use_tensor=True)
+        text_embed = self.model.get_text_embedding(
+            descriptions, use_tensor=True)
         bsz = len(extracted_audio)
         candidates = len(audio_embed) // bsz
         audio_embed = audio_embed.reshape(bsz, candidates, -1)

@@ -4,6 +4,7 @@ import json
 import logging
 import math
 import os
+import time
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -17,6 +18,17 @@ from sam_audio.model.config import SAMAudioConfig, SAMAudioJudgeConfig
 
 logger = logging.getLogger(__name__)
 
+
+def _emit_load_progress(message: str, *args):
+    logger.info(message, *args)
+    if os.environ.get("SAM_AUDIO_LOAD_VERBOSE") == "1":
+        try:
+            text = message % args if args else message
+        except Exception:
+            text = f"{message} {args}"
+        print(f"[{__name__}] {text}", flush=True)
+
+
 Anchor = Tuple[str, float, float]
 
 
@@ -26,13 +38,20 @@ def batch_audio(
     wavs = []
     for audio in audios:
         if isinstance(audio, str):
-            wav, sr = torchaudio.load(audio)
-            if sr != audio_sampling_rate:
-                wav = torchaudio.functional.resample(wav, sr, audio_sampling_rate)
+            decoder = AudioDecoder(
+                audio,
+                sample_rate=audio_sampling_rate,
+                num_channels=1,
+            )
+            wav = decoder.get_all_samples().data
         else:
             wav = audio
         wavs.append(wav.mean(0))
-    sizes = torch.tensor([wav.size(-1) for wav in wavs])
+    device = wavs[0].device if len(wavs) > 0 else None
+    sizes = torch.tensor(
+        [wav.size(-1) for wav in wavs],
+        device=device,
+    )
     return pad_sequence(wavs, batch_first=True).unsqueeze(1), sizes
 
 
@@ -63,16 +82,19 @@ class Batch:
     def _wav_to_feature_idx(self, wav_idx: int):
         return math.ceil(wav_idx / self.hop_length)
 
-    def to(self, device: torch.device):
-        self.audios = self.audios.to(device)
-        self.anchor_ids = self.anchor_ids.to(device)
-        self.anchor_alignment = self.anchor_alignment.to(device)
-        self.sizes = self.sizes.to(device)
-        self.wav_sizes = self.wav_sizes.to(device)
+    def to(self, device: torch.device, non_blocking: bool = False):
+        self.audios = self.audios.to(device, non_blocking=non_blocking)
+        self.anchor_ids = self.anchor_ids.to(device, non_blocking=non_blocking)
+        self.anchor_alignment = self.anchor_alignment.to(
+            device, non_blocking=non_blocking)
+        self.sizes = self.sizes.to(device, non_blocking=non_blocking)
+        self.wav_sizes = self.wav_sizes.to(device, non_blocking=non_blocking)
         if self.audio_pad_mask is not None:
-            self.audio_pad_mask = self.audio_pad_mask.to(device)
+            self.audio_pad_mask = self.audio_pad_mask.to(
+                device, non_blocking=non_blocking)
         if self.masked_video is not None:
-            self.masked_video = [v.to(device) for v in self.masked_video]
+            self.masked_video = [
+                v.to(device, non_blocking=non_blocking) for v in self.masked_video]
         return self
 
     def process_anchors(self, anchors: Optional[list[list[Anchor]]]):
@@ -149,7 +171,8 @@ def load_video(
             assert video.size(1) == 3, (
                 f"Expected video tensor to be in NCHW format, but found {video.size(1)} channels"
             )
-            idx = torch.linspace(0, video.size(0) - 1, int(size)).round().long()
+            idx = torch.linspace(0, video.size(
+                0) - 1, int(size)).round().long()
             frames = video[idx]
         all_frames.append(frames)
     return all_frames
@@ -167,11 +190,24 @@ class Processor:
         if os.path.exists(model_name_or_path):
             config_path = os.path.join(model_name_or_path, "config.json")
         else:
+            t0 = time.perf_counter()
+            _emit_load_progress(
+                "Downloading config.json for %s (revision=%s)",
+                model_name_or_path,
+                cls.revision,
+            )
             config_path = hf_hub_download(
                 repo_id=model_name_or_path,
                 filename="config.json",
                 revision=cls.revision,
             )
+            _emit_load_progress(
+                "config.json downloaded for %s to %s (%.1fs)",
+                model_name_or_path,
+                config_path,
+                time.perf_counter() - t0,
+            )
+        _emit_load_progress("Reading config.json from %s", config_path)
         with open(config_path) as fin:
             config = cls.config_cls(**json.load(fin))
         return config
@@ -199,8 +235,10 @@ class Processor:
         videos: List[str | torch.Tensor],
         masks: List[str | torch.Tensor],
     ) -> list[torch.Tensor]:
-        video = [VideoDecoder(v)[:] if isinstance(v, str) else v for v in videos]
-        video_mask = [VideoDecoder(v)[:] if isinstance(v, str) else v for v in masks]
+        video = [VideoDecoder(v)[:] if isinstance(v, str)
+                 else v for v in videos]
+        video_mask = [VideoDecoder(v)[:] if isinstance(
+            v, str) else v for v in masks]
         return [v * m.eq(0) for v, m in zip(video, video_mask, strict=False)]
 
 
@@ -288,11 +326,13 @@ class SAMAudioJudgeProcessor(Processor):
             wav = wav.unsqueeze(0)
         if wav.size(-1) % self.audio_hop_length == 0:
             return wav
-        p1d = (0, self.audio_hop_length - (wav.size(-1) % self.audio_hop_length))
+        p1d = (0, self.audio_hop_length -
+               (wav.size(-1) % self.audio_hop_length))
         return torch.nn.functional.pad(wav, p1d, mode="reflect")
 
     def _load_audio(self, path: str):
-        ad = AudioDecoder(path, sample_rate=self.audio_sampling_rate, num_channels=1)
+        ad = AudioDecoder(
+            path, sample_rate=self.audio_sampling_rate, num_channels=1)
         return ad.get_all_samples().data
 
     def _process_audio(
@@ -336,9 +376,14 @@ class SAMAudioJudgeProcessor(Processor):
                     f"Expected input shape (channels, num_samples), but got shape ({example.shape})"
                 )
 
-        lengths = torch.tensor([x.size(0) for x in raw_audio])
-        input_values = pad_sequence(raw_audio, batch_first=True).transpose(1, 2)
-        padding_mask = torch.arange(lengths.max())[None] < lengths[:, None]
+        device = raw_audio[0].device
+        lengths = torch.tensor([x.size(0) for x in raw_audio], device=device)
+        input_values = pad_sequence(
+            raw_audio, batch_first=True).transpose(1, 2)
+        padding_mask = (
+            torch.arange(int(lengths.max()), device=device)[
+                None] < lengths[:, None]
+        )
 
         return BatchFeature(
             {"input_values": input_values, "padding_mask": padding_mask}

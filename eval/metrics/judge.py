@@ -5,6 +5,7 @@ from typing import Optional
 import torch
 
 from sam_audio import SAMAudioJudgeModel, SAMAudioJudgeProcessor
+from sam_audio.runtime import auto_tune
 
 
 class Judge(torch.nn.Module):
@@ -14,11 +15,12 @@ class Judge(torch.nn.Module):
         device: Optional[torch.device] = None,
     ):
         super().__init__()
-        self.model = SAMAudioJudgeModel.from_pretrained(checkpoint).to(device)
-        self.processor = SAMAudioJudgeProcessor.from_pretrained(checkpoint)
-        self.device = device or torch.device(
+        self.device = auto_tune(device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
-        )
+        ))
+        self.model = SAMAudioJudgeModel.from_pretrained(
+            checkpoint).to(self.device)
+        self.processor = SAMAudioJudgeProcessor.from_pretrained(checkpoint)
 
     def forward(
         self,
@@ -31,8 +33,8 @@ class Judge(torch.nn.Module):
         with torch.inference_mode():
             processed = self.processor(
                 text=descriptions,
-                input_audio=[x.cpu() for x in input_wavs],
-                separated_audio=[x.cpu() for x in target_wavs],
+                input_audio=input_wavs,
+                separated_audio=target_wavs,
                 sampling_rate=target_wavs_sample_rate,
             ).to(self.device)
             result = self.model(**processed)

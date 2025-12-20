@@ -35,7 +35,8 @@ class SAMAudioBench(torch.utils.data.Dataset):
         self._span = span
         self._visual = visual
         if subset is not None:
-            self.dataset = self.dataset.filter(lambda x: subset in x["paper_eval_sets"])
+            self.dataset = self.dataset.filter(
+                lambda x: subset in x["paper_eval_sets"])
 
         self.cache_path = os.path.join(cache_path, "sam_audio_bench")
         self.collate_fn = collate_fn
@@ -85,7 +86,8 @@ class SAMAudioBench(torch.utils.data.Dataset):
         if item["mask_bytes"] is None:
             return None
 
-        mask = torch.from_numpy(np.load(BytesIO(item["mask_bytes"]))["video_masklet"])
+        mask = torch.from_numpy(
+            np.load(BytesIO(item["mask_bytes"]))["video_masklet"])
 
         video_decoder = VideoDecoder(video_path)
         if select_frames:
@@ -99,7 +101,8 @@ class SAMAudioBench(torch.utils.data.Dataset):
             # It's possible that the mask and the video frames differ by a small amount
             # we interpolate the mask frame to match
             idxs = (
-                torch.linspace(0, mask.size(0) - 1, video_frames.size(0)).round().long()
+                torch.linspace(0, mask.size(0) - 1,
+                               video_frames.size(0)).round().long()
             )
             mask = mask[idxs]
 
@@ -107,13 +110,6 @@ class SAMAudioBench(torch.utils.data.Dataset):
 
         if mask.shape[-2:] != video_frames.shape[-2:]:
             mask = F.interpolate(mask, size=video_frames.shape[-2:])
-
-        import torchvision
-
-        torchvision.io.write_video("test.mp4", video_frames.permute(0, 2, 3, 1), 30)
-        torchvision.io.write_video(
-            "test_mask.mp4", mask.unsqueeze(-1).expand(-1, -1, -1, 3) * 255, 30
-        )
 
         return video_frames * mask
 
@@ -128,22 +124,20 @@ class SAMAudioBench(torch.utils.data.Dataset):
         )
         assert os.path.exists(video_path), f"{video_path} does not exist!"
 
-        audio_decoder = AudioDecoder(video_path)
+        audio_decoder = AudioDecoder(
+            video_path,
+            sample_rate=self.collate_fn.audio_sampling_rate,
+            num_channels=1,
+        )
         audio_samples = audio_decoder.get_samples_played_in_range(
             start_seconds=item["start_offset"] if select_frames else 0,
             stop_seconds=item["end_offset"] if select_frames else None,
         )
 
-        if audio_samples.sample_rate != self.collate_fn.audio_sampling_rate:
-            resampled_audio = torchaudio.functional.resample(
-                audio_samples.data,
-                audio_samples.sample_rate,
-                self.collate_fn.audio_sampling_rate,
-            )
-        else:
-            resampled_audio = audio_samples.data
+        resampled_audio = audio_samples.data
 
-        masked_video_frames = self._get_masked_video(item, video_path, select_frames)
+        masked_video_frames = self._get_masked_video(
+            item, video_path, select_frames)
 
         return Item(
             description=item["description"],

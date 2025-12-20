@@ -58,15 +58,12 @@ class MUSDB(Dataset):
         item = self.ds[idx]
         path = os.path.join(self.cache_path, "test", item["id"], "mixture.wav")
         assert os.path.exists(path), f"{path} does not exist!"
-        decoder = AudioDecoder(path)
-        data = decoder.get_samples_played_in_range(item["start_time"], item["end_time"])
+        decoder = AudioDecoder(
+            path, sample_rate=self.sample_rate, num_channels=1)
+        data = decoder.get_samples_played_in_range(
+            item["start_time"], item["end_time"])
         wav = data.data
-        if data.sample_rate != self.sample_rate:
-            wav = torchaudio.functional.resample(
-                wav, data.sample_rate, self.sample_rate
-            )
-        wav = wav.mean(0, keepdim=True)
-        return wav, item["description"]
+        return wav.mean(0, keepdim=True), item["description"]
 
 
 if __name__ == "__main__":

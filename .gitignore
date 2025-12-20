@@ -6,3 +6,4 @@ build
 dist
 .checkpoints
 .ipynb_checkpoints
+.agent/

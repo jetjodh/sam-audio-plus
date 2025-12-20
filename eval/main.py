@@ -14,6 +14,7 @@ from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from sam_audio import SAMAudio, SAMAudioProcessor
+from sam_audio.runtime import auto_tune
 
 
 def gather_and_average_results(results, world_size):
@@ -58,31 +59,56 @@ def main(
         torch.distributed.init_process_group(backend="nccl")
         device = torch.device(f"cuda:{rank}")
         torch.cuda.set_device(device)
+    device = auto_tune(device)
 
-    model = SAMAudio.from_pretrained(checkpoint_path)
-    model = model.eval().to(device)
+    if device.type == "cuda" and os.environ.get("SAM_AUDIO_AUTO_CHECKPOINT", "1") != "0":
+        total_gb = torch.cuda.get_device_properties(
+            device).total_memory / (1024**3)
+        if checkpoint_path == "facebook/sam-audio-large" and total_gb <= 9:
+            print(
+                f"Auto-selecting smaller checkpoint for {total_gb:.1f}GB GPU: facebook/sam-audio-small",
+                flush=True,
+            )
+            checkpoint_path = "facebook/sam-audio-small"
+        if os.environ.get("SAM_AUDIO_AUTO_CANDIDATES", "1") != "0" and total_gb <= 9:
+            if reranking_candidates > 2:
+                print(
+                    f"Auto-reducing reranking candidates on {total_gb:.1f}GB GPU: {reranking_candidates} -> 2",
+                    flush=True,
+                )
+                reranking_candidates = 2
+
+    model = SAMAudio.from_pretrained(checkpoint_path).eval()
+    device = auto_tune(model.device())
     processor = SAMAudioProcessor.from_pretrained(checkpoint_path)
 
     judge_metric = Judge(device=device)
     aes_metric = Aesthetic(device=device)
     clap_metric = CLAP(device=device)
-    imagebind_metric = ImageBind(device=device)
+    imagebind_metric = None
 
     for setting in settings:
         print(f"Evaluating: {setting}")
-        dset = make_dataset(setting, cache_path=cache_path, collate_fn=processor)
+        dset = make_dataset(setting, cache_path=cache_path,
+                            collate_fn=processor)
         sampler = None
         if world_size > 1:
             sampler = DistributedSampler(dset)
 
-        dl = DataLoader(
-            dset,
-            batch_size=batch_size,
-            shuffle=False,
-            collate_fn=dset.collate,
-            num_workers=num_workers,
-            sampler=sampler,
-        )
+        dl_kwargs = {
+            "batch_size": batch_size,
+            "shuffle": False,
+            "collate_fn": dset.collate,
+            "num_workers": num_workers,
+            "sampler": sampler,
+        }
+        if device.type == "cuda":
+            dl_kwargs["pin_memory"] = True
+        if num_workers > 0:
+            dl_kwargs["persistent_workers"] = True
+            dl_kwargs["prefetch_factor"] = 2
+
+        dl = DataLoader(dset, **dl_kwargs)
 
         all_metrics = [
             judge_metric,
@@ -91,19 +117,21 @@ def main(
         ]
 
         if dset.visual:
+            if imagebind_metric is None:
+                imagebind_metric = ImageBind(device=device)
             all_metrics.append(imagebind_metric)
 
-        dfs = []
+        results = {}
         with torch.inference_mode():
             for batch in tqdm(dl, disable=rank > 1):
-                batch = batch.to(device)
+                batch = batch.to(device, non_blocking=device.type == "cuda")
                 result = model.separate(
                     batch, reranking_candidates=reranking_candidates
                 )
+                input_wavs = model.unbatch(
+                    batch.audios.squeeze(1), batch.wav_sizes)
                 mets = {}
                 for metric in all_metrics:
-                    input_wavs = model.unbatch(batch.audios.squeeze(1), batch.wav_sizes)
-
                     mets.update(
                         metric(
                             target_wavs=result.target,
@@ -114,9 +142,12 @@ def main(
                         )
                     )
 
-                dfs.append(pd.DataFrame.from_dict(mets))
+                for k, v in mets.items():
+                    if k not in results:
+                        results[k] = []
+                    results[k].extend(v)
 
-        df = pd.concat(dfs)
+        df = pd.DataFrame.from_dict(results)
         averaged_results = gather_and_average_results(df, world_size)
         if rank == 0:
             results_dict = {k: f"{v:.3f}" for k, v in averaged_results.items()}
@@ -146,7 +177,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint-path", "-p", type=str, default="facebook/sam-audio-large"
     )
-    parser.add_argument("--batch-size", "-b", type=int, default=1, help="Batch size")
+    parser.add_argument("--batch-size", "-b", type=int,
+                        default=1, help="Batch size")
     parser.add_argument(
         "--num-workers", "-w", type=int, default=4, help="Number of workers"
     )
