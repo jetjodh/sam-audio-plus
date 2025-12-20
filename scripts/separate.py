@@ -22,6 +22,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+import warnings
+
+# Suppress warnings from dependencies
+# Must be filtered before importing torch to catch init warnings
+warnings.filterwarnings("ignore", category=FutureWarning, message="The pynvml package is deprecated")
+warnings.filterwarnings("ignore", category=FutureWarning, message="Importing from timm.models.layers is deprecated")
+warnings.filterwarnings("ignore", category=UserWarning, message="torch.meshgrid: in an upcoming release")
+
 import torch
 import torchaudio
 

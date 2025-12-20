@@ -10,11 +10,13 @@ from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
 from torchdiffeq import odeint
 
 from sam_audio.runtime import (
+    async_init,
     autocast_context,
     clear_cuda_cache,
     compile_model,
     get_ode_options,
     should_compile,
+    wrap_with_cuda_graph,
 )
 from sam_audio.model.align import AlignModalities
 from sam_audio.model.base import BaseModel
@@ -87,21 +89,42 @@ class SAMAudio(BaseModel):
 
     def __init__(self, cfg: SAMAudioConfig):
         super().__init__()
-        self.audio_codec = DACVAE(cfg.audio_codec)
-        self.text_encoder = T5TextEncoder(cfg.text_encoder)
+        # Start initializing heavy components in background threads
+        future_codec = async_init(DACVAE, cfg.audio_codec)
+        future_text = async_init(T5TextEncoder, cfg.text_encoder)
+
         self._vision_encoder_cfg = cfg.vision_encoder
         self._vision_dim = cfg.vision_encoder.dim
         self.vision_encoder = None
-        self.transformer = DiT(cfg.transformer)
-        self.proj = torch.nn.Linear(cfg.in_channels, cfg.transformer.dim)
-        self.align_masked_video = AlignModalities(
-            cfg.vision_encoder.dim, cfg.transformer.dim
-        )
-        self.embed_anchors = EmbedAnchors(
-            cfg.num_anchors, cfg.anchor_embedding_dim, cfg.transformer.dim
-        )
-        self.memory_proj = torch.nn.Linear(
-            cfg.text_encoder.dim, cfg.transformer.dim)
+        
+        # Initialize large components on meta device to save time/memory
+        with torch.device("meta"):
+            self.transformer = DiT(cfg.transformer)
+            self.proj = torch.nn.Linear(cfg.in_channels, cfg.transformer.dim)
+            self.align_masked_video = AlignModalities(
+                cfg.vision_encoder.dim, cfg.transformer.dim
+            )
+            self.embed_anchors = EmbedAnchors(
+                cfg.num_anchors, cfg.anchor_embedding_dim, cfg.transformer.dim
+            )
+            self.memory_proj = torch.nn.Linear(
+                cfg.text_encoder.dim, cfg.transformer.dim)
+
+        # Manually fix RoPE buffers to be on CPU (since they are non-persistent and were on meta)
+        if self.transformer.rope_embeddings is not None:
+             self.transformer.rope_embeddings.reset_parameters()
+             
+        # Manually fix TimestepEmbedder buffer
+        if self.transformer.t_embedder is not None:
+             t_emb = self.transformer.t_embedder
+             half = t_emb.frequency_embedding_size // 2
+             freqs = torch.exp(
+                -math.log(10000)
+                * torch.arange(start=0, end=half, dtype=torch.float32)
+                / half
+             )
+             t_emb.register_buffer("freqs", freqs, persistent=False)
+
         self.timestep_emb = SinusoidalEmbedding(cfg.transformer.dim)
         self._visual_ranker_cfg = cfg.visual_ranker
         self._text_ranker_cfg = cfg.text_ranker
@@ -110,6 +133,14 @@ class SAMAudio(BaseModel):
         self._span_predictor_cfg = cfg.span_predictor
         self.span_predictor = None
         self.span_predictor_transform = None
+        
+        # Wait for background initialization to complete
+        self.audio_codec = future_codec.result()
+        self.text_encoder = future_text.result()
+        
+        # Pre-allocated noise tensor pool for reduced allocation overhead
+        # Keyed by (batch_size, seq_len, channels) tuple
+        self._noise_pool: dict = {}
 
     def _get_vision_encoder(self):
         if self.vision_encoder is None:
@@ -150,6 +181,122 @@ class SAMAudio(BaseModel):
     @property
     def sample_rate(self):
         return self.audio_codec.sample_rate
+
+    def _get_noise(self, like: torch.Tensor, force_new: bool = False) -> torch.Tensor:
+        """
+        Get or create a noise tensor from the pool.
+        
+        This reduces memory allocation overhead by reusing pre-allocated tensors
+        when possible. The tensor is re-randomized to ensure fresh noise.
+        
+        Args:
+            like: Template tensor to match shape, dtype, and device.
+            force_new: If True, always allocate a new tensor.
+        
+        Returns:
+            Random noise tensor with same shape/dtype/device as `like`.
+        """
+        if force_new:
+            return torch.randn_like(like)
+        
+        shape_key = (like.shape, like.dtype, like.device)
+        
+        if shape_key in self._noise_pool:
+            # Reuse existing tensor, but re-randomize it
+            noise = self._noise_pool[shape_key]
+            noise.normal_()  # In-place randomization
+            return noise
+        
+        # Create new tensor and cache it
+        # Limit pool size to prevent memory bloat (keep last 4 shapes)
+        if len(self._noise_pool) >= 4:
+            oldest_key = next(iter(self._noise_pool))
+            del self._noise_pool[oldest_key]
+        
+        noise = torch.randn_like(like)
+        self._noise_pool[shape_key] = noise
+        return noise
+
+    def warmup(
+        self,
+        batch_size: int = 1,
+        seq_len: int = 256,
+        description: str = "warmup",
+    ) -> None:
+        """
+        Warmup the model by running a dummy inference to compile CUDA kernels.
+        
+        This pre-compiles JIT code, torch.compile graphs, and triggers cuDNN
+        autotuning, reducing latency on the first real inference.
+        
+        Args:
+            batch_size: Batch size for warmup inference.
+            seq_len: Sequence length (audio frames) for warmup.
+            description: Dummy text description.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        device = self.device()
+        dtype = next(self.parameters()).dtype
+        
+        logger.info("Running ODE solver warmup to compile kernels...")
+        
+        try:
+            # Create minimal dummy inputs
+            # seq_len corresponds to audio codec frames, not raw samples
+            in_channels = self.proj.in_features
+            
+            # Create dummy noisy_audio input
+            dummy_noisy = torch.randn(
+                batch_size, seq_len, in_channels,
+                device=device, dtype=dtype
+            )
+            
+            # Create dummy audio features (doubled as in the real forward)
+            feature_dim = in_channels // 3  # proj expects [noisy, zeros, features]
+            dummy_features = torch.randn(
+                batch_size, seq_len, feature_dim * 2,
+                device=device, dtype=dtype
+            )
+            
+            # Create dummy text features
+            text_dim = self.memory_proj.in_features
+            dummy_text = torch.randn(batch_size, 16, text_dim, device=device, dtype=dtype)
+            text_mask = torch.zeros(batch_size, 16, dtype=torch.bool, device=device)
+            
+            # Create dummy video features
+            vision_dim = self._vision_dim
+            dummy_video = torch.zeros(batch_size, vision_dim, seq_len, device=device, dtype=dtype)
+            
+            # Run a few forward passes to warmup
+            dummy_time = torch.tensor([0.5], device=device, dtype=dtype)
+            
+            for _ in range(2):  # 2 warmup passes
+                with autocast_context(device=device):
+                    aligned = self.align_inputs(
+                        dummy_noisy[:, :, :feature_dim * 2],
+                        dummy_features,
+                        masked_video_features=dummy_video,
+                    )
+                    _ = self.transformer(
+                        aligned,
+                        dummy_time.expand(batch_size),
+                        padding_mask=None,
+                        memory=self.memory_proj(dummy_text) + self.timestep_emb(
+                            dummy_time, pos=dummy_time
+                        ).unsqueeze(1),
+                        memory_padding_mask=text_mask,
+                    )
+            
+            # Synchronize to ensure all kernels are compiled
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            
+            logger.info("ODE solver warmup complete")
+            
+        except Exception as e:
+            logger.warning("Warmup failed (non-fatal): %s", e)
 
     def align_inputs(
         self,
@@ -355,6 +502,12 @@ class SAMAudio(BaseModel):
             ),
         }
 
+        # Aggressive memory clearing after encoding (task-12)
+        # Free intermediate tensors before compute-intensive ODE loop
+        if device.type == "cuda":
+            del audio_features, text_features, text_mask, masked_video_features
+            clear_cuda_cache(log=False)
+
         if predict_spans and batch.anchors is None and self._span_predictor_cfg is not None:
             self._get_span_predictor()
             batch = self.predict_spans(
@@ -372,7 +525,7 @@ class SAMAudio(BaseModel):
         C = C // 2  # we stack audio_features, so the actual channels is half
 
         if noise is None:
-            noise = torch.randn_like(audio_features)
+            noise = self._get_noise(audio_features)
 
         def vector_field(t, noisy_audio):
             with autocast_context(device=noisy_audio.device):
@@ -383,6 +536,10 @@ class SAMAudio(BaseModel):
                 )
             return res
 
+        # Wrap with CUDA graph for reduced kernel launch overhead
+        # (only active when SAM_AUDIO_CUDA_GRAPHS=1 and SAM_AUDIO_COMPILE=0)
+        vector_field = wrap_with_cuda_graph(vector_field, warmup_runs=3)
+
         log_memory("pre_ode_vram", device)
 
         with measure_time("ode_solver_time"):
@@ -392,6 +549,11 @@ class SAMAudio(BaseModel):
                 torch.tensor([0.0, 1.0], device=noise.device),
                 **ode_opt,
             )
+
+        # Clear ODE intermediates before decoding (task-12)
+        if device.type == "cuda":
+            del forward_args, noise
+            clear_cuda_cache(log=False)
             
         generated_features = states[-1].transpose(1, 2)
         # generated_features has shape [B, 2C, T].  Reshape to stack along the batch dimension
@@ -487,10 +649,10 @@ class SAMAudio(BaseModel):
             predict_spans=predict_spans,
         )
 
-    def load_state_dict(self, state_dict, strict=True):
+    def load_state_dict(self, state_dict, strict=True, assign=False):
         if strict:
             missing_keys, unexpected_keys = super().load_state_dict(
-                state_dict, strict=False
+                state_dict, strict=False, assign=assign
             )
             # We load this directly from HF, not in checkpoint
             skip_regex = re.compile(

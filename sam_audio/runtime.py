@@ -76,6 +76,146 @@ def compile_model(
         return model
 
 
+def should_use_cuda_graphs() -> bool:
+    """
+    Check if CUDA graphs should be used for kernel launch overhead reduction.
+    
+    CUDA graphs are an alternative to torch.compile's reduce-overhead mode.
+    They are most beneficial when torch.compile is disabled.
+    
+    Control via SAM_AUDIO_CUDA_GRAPHS environment variable.
+    Defaults to False (torch.compile is preferred).
+    """
+    if not torch.cuda.is_available():
+        return False
+    # Only use CUDA graphs if explicitly enabled AND torch.compile is disabled
+    # (since torch.compile with reduce-overhead already uses CUDA graphs internally)
+    return _env_truthy("SAM_AUDIO_CUDA_GRAPHS", default=False) and not should_compile()
+
+
+class CUDAGraphWrapper:
+    """
+    Wrapper for capturing and replaying CUDA graphs.
+    
+    This reduces kernel launch overhead by capturing a sequence of CUDA operations
+    and replaying them as a single graph execution.
+    
+    Note: CUDA graphs require fixed input shapes. The wrapper handles warmup
+    and graph capture automatically on first call with a new input shape.
+    """
+    
+    def __init__(self, func, warmup_runs: int = 3):
+        """
+        Initialize CUDA graph wrapper.
+        
+        Args:
+            func: The function to wrap. Must accept and return tensors.
+            warmup_runs: Number of warmup runs before graph capture.
+        """
+        self.func = func
+        self.warmup_runs = warmup_runs
+        self._graphs = {}  # Cache graphs by input shape
+        self._static_inputs = {}  # Static input tensors for graph replay
+        self._static_outputs = {}  # Static output tensors from graph replay
+        self._warmup_counts = {}  # Track warmup progress per shape
+    
+    def __call__(self, *args, **kwargs):
+        """Execute the function, using CUDA graph if available."""
+        if not torch.cuda.is_available() or not args:
+            return self.func(*args, **kwargs)
+        
+        # Get input shape signature for caching
+        shape_key = self._get_shape_key(args)
+        
+        # Check if we have a cached graph
+        if shape_key in self._graphs:
+            return self._replay_graph(shape_key, args)
+        
+        # Track warmup runs
+        if shape_key not in self._warmup_counts:
+            self._warmup_counts[shape_key] = 0
+        
+        # Run warmup
+        if self._warmup_counts[shape_key] < self.warmup_runs:
+            self._warmup_counts[shape_key] += 1
+            return self.func(*args, **kwargs)
+        
+        # Capture graph after warmup
+        try:
+            return self._capture_and_run(shape_key, args, kwargs)
+        except Exception:
+            # Fall back to non-graph execution on any error
+            return self.func(*args, **kwargs)
+    
+    def _get_shape_key(self, args):
+        """Generate a hashable key from tensor shapes."""
+        shapes = []
+        for arg in args:
+            if isinstance(arg, torch.Tensor):
+                shapes.append(tuple(arg.shape))
+            else:
+                shapes.append(type(arg).__name__)
+        return tuple(shapes)
+    
+    def _capture_and_run(self, shape_key, args, kwargs):
+        """Capture CUDA graph and execute."""
+        # Create static copies of inputs
+        static_inputs = tuple(
+            arg.clone() if isinstance(arg, torch.Tensor) else arg
+            for arg in args
+        )
+        self._static_inputs[shape_key] = static_inputs
+        
+        # Warmup run before capture
+        torch.cuda.synchronize()
+        _ = self.func(*static_inputs, **kwargs)
+        torch.cuda.synchronize()
+        
+        # Capture graph
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            static_output = self.func(*static_inputs, **kwargs)
+        
+        self._graphs[shape_key] = graph
+        self._static_outputs[shape_key] = static_output
+        
+        # Replay with actual inputs
+        return self._replay_graph(shape_key, args)
+    
+    def _replay_graph(self, shape_key, args):
+        """Replay cached CUDA graph with new inputs."""
+        # Copy inputs to static buffers
+        static_inputs = self._static_inputs[shape_key]
+        for src, dst in zip(args, static_inputs):
+            if isinstance(src, torch.Tensor) and isinstance(dst, torch.Tensor):
+                dst.copy_(src)
+        
+        # Replay graph
+        self._graphs[shape_key].replay()
+        
+        # Return output (copy to avoid returning static buffer)
+        output = self._static_outputs[shape_key]
+        if isinstance(output, torch.Tensor):
+            return output.clone()
+        return output
+
+
+def wrap_with_cuda_graph(func, warmup_runs: int = 3):
+    """
+    Wrap a function with CUDA graph capture for reduced kernel launch overhead.
+    
+    Args:
+        func: Function to wrap.
+        warmup_runs: Number of warmup runs before graph capture.
+    
+    Returns:
+        Wrapped function that uses CUDA graphs when enabled.
+    """
+    if not should_use_cuda_graphs():
+        return func
+    return CUDAGraphWrapper(func, warmup_runs=warmup_runs)
+
+
 def get_default_device() -> torch.device:
     if torch.cuda.is_available():
         local_rank = os.environ.get("LOCAL_RANK")
@@ -117,6 +257,96 @@ def auto_tune(device: torch.device | None = None) -> torch.device:
         _maybe_call(torch.backends.cuda, "enable_math_sdp", True)
 
     return device
+
+
+# Attention kernel selection based on sequence length
+# FlashAttention-2 is more efficient for longer sequences
+# Memory-efficient attention is better for shorter sequences with irregular shapes
+_FLASH_ATTENTION_THRESHOLD = _env_int("SAM_AUDIO_FLASH_THRESHOLD", 1024)
+
+
+def get_preferred_sdp_backend(seq_len: int) -> str:
+    """
+    Get the preferred SDPA backend based on sequence length.
+    
+    Args:
+        seq_len: Sequence length for the attention operation.
+    
+    Returns:
+        Backend name: 'flash', 'mem_efficient', or 'math'
+    """
+    if seq_len >= _FLASH_ATTENTION_THRESHOLD:
+        return "flash"
+    return "mem_efficient"
+
+
+from contextlib import contextmanager
+
+
+@contextmanager
+def sdp_kernel_context(seq_len: Optional[int] = None, backend: Optional[str] = None):
+    """
+    Context manager for selecting SDPA kernel based on sequence length.
+    
+    This optimizes attention performance by selecting the best kernel:
+    - 'flash': FlashAttention-2, best for long sequences (>=1024)
+    - 'mem_efficient': Memory-efficient attention, best for shorter sequences
+    - 'math': Standard math implementation, fallback
+    
+    Args:
+        seq_len: Sequence length to auto-select backend for.
+        backend: Explicit backend override ('flash', 'mem_efficient', 'math').
+    
+    Example:
+        with sdp_kernel_context(seq_len=2048):
+            # Will use FlashAttention-2
+            output = F.scaled_dot_product_attention(q, k, v)
+    """
+    if not torch.cuda.is_available():
+        yield
+        return
+    
+    # Determine which backend to use
+    if backend is None and seq_len is not None:
+        backend = get_preferred_sdp_backend(seq_len)
+    
+    if backend is None:
+        yield
+        return
+    
+    # Check if context manager is available (PyTorch 2.0+)
+    if not hasattr(torch.backends.cuda, "sdp_kernel"):
+        yield
+        return
+    
+    # Configure backends based on selection
+    try:
+        if backend == "flash":
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=True,
+                enable_mem_efficient=False,
+                enable_math=False,
+            ):
+                yield
+        elif backend == "mem_efficient":
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=True,
+                enable_math=False,
+            ):
+                yield
+        elif backend == "math":
+            with torch.backends.cuda.sdp_kernel(
+                enable_flash=False,
+                enable_mem_efficient=False,
+                enable_math=True,
+            ):
+                yield
+        else:
+            yield
+    except Exception:
+        # Fall back to default behavior on any error
+        yield
 
 
 def get_autocast_dtype(device: torch.device | None = None) -> torch.dtype | None:
@@ -284,3 +514,22 @@ def synchronize_cuda(device: torch.device | None = None) -> None:
     device = device or get_default_device()
     if device.type == "cuda":
         torch.cuda.synchronize(device)
+
+from concurrent.futures import ThreadPoolExecutor
+
+class AsyncInit:
+    """Helper for initializing objects in a background thread."""
+    def __init__(self, cls, *args, **kwargs):
+        self.cls = cls
+        self.args = args
+        self.kwargs = kwargs
+        self._future = ThreadPoolExecutor(max_workers=1).submit(self._init)
+
+    def _init(self):
+        return self.cls(*self.args, **self.kwargs)
+
+    def result(self):
+        return self._future.result()
+
+def async_init(cls, *args, **kwargs) -> AsyncInit:
+    return AsyncInit(cls, *args, **kwargs)

@@ -12,6 +12,7 @@ from einops import rearrange
 from .config import TransformerConfig
 from .patcher import Patcher
 from .rope import RotaryEmbedding
+from sam_audio.runtime import sdp_kernel_context
 
 
 def gate(x, gate):
@@ -159,10 +160,13 @@ class Attention(nn.Module):
         if key_padding_mask is not None:
             attn_mask = key_padding_mask[:, None, None, :]
 
-        # Use scaled_dot_product_attention for flash attention when available
-        output = F.scaled_dot_product_attention(
-            xq, xk, xv, attn_mask=attn_mask, scale=self._scale
-        )
+        # Use scaled_dot_product_attention with intelligent kernel selection
+        # FlashAttention-2 for long sequences (>=1024), memory-efficient for shorter
+        seq_len = xq.size(2)  # B, H, T, D -> T is at index 2
+        with sdp_kernel_context(seq_len=seq_len):
+            output = F.scaled_dot_product_attention(
+                xq, xk, xv, attn_mask=attn_mask, scale=self._scale
+            )
 
         output = rearrange(output, "b h n d -> b n (h d)")
         return self.wo(output)

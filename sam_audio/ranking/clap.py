@@ -8,7 +8,7 @@ import torchaudio
 from huggingface_hub import hf_hub_download
 
 from sam_audio.model.config import ClapRankerConfig
-from sam_audio.runtime import auto_tune
+from sam_audio.runtime import auto_tune, autocast_context
 from sam_audio.ranking.ranker import Ranker
 
 
@@ -120,10 +120,13 @@ class ClapRanker(Ranker):
         sample_rate: int = 48_000,
         **kwargs,
     ):
-        audio_embed = self.model.model.get_audio_embedding(
-            self._prepare_audio(extracted_audio, sample_rate)
-        )
-        text_embed = self._get_text_embedding_cached(descriptions)
+        device = next(self.model.parameters()).device
+        # Use half precision for faster inference (task-34)
+        with autocast_context(device=device):
+            audio_embed = self.model.model.get_audio_embedding(
+                self._prepare_audio(extracted_audio, sample_rate)
+            )
+            text_embed = self._get_text_embedding_cached(descriptions)
         bsz = len(extracted_audio)
         candidates = len(audio_embed) // bsz
         audio_embed = audio_embed.reshape(bsz, candidates, -1)

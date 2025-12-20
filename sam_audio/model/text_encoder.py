@@ -27,6 +27,18 @@ class T5TextEncoder(torch.nn.Module):
         self._cache: dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
         self._cache_device: Optional[torch.device] = None
 
+        # Apply torch.compile for faster inference (task-21)
+        from sam_audio.runtime import should_compile
+        if should_compile():
+            try:
+                self.model = torch.compile(
+                    self.model,
+                    mode="reduce-overhead",
+                    dynamic=True,  # Text lengths vary
+                )
+            except Exception:
+                pass  # Fall back to uncompiled model
+
     def clear_cache(self) -> None:
         """Clear the text embedding cache."""
         self._cache.clear()

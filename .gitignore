@@ -9,3 +9,9 @@ dist
 .agent/
 logs/
 metrics_logs/
+*.mp4
+*.opus
+*.vtt
+
+# input files
+audio-input/

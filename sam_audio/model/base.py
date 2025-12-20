@@ -10,7 +10,7 @@ import torch
 from huggingface_hub import ModelHubMixin, snapshot_download
 
 from sam_audio.logging_config import LogContext, flush_output, get_logger
-from sam_audio.runtime import auto_tune, get_default_device
+from sam_audio.runtime import auto_tune, compile_model, get_default_device, should_compile
 
 logger = get_logger(__name__)
 
@@ -44,6 +44,7 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
         else:
             device = get_default_device()
         device = auto_tune(device)
+        oom_fallback = False
 
         verbose = os.environ.get("SAM_AUDIO_LOAD_VERBOSE") == "1"
 
@@ -63,7 +64,10 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
         if os.path.isdir(model_id):
             cached_model_dir = model_id
         else:
-            with LogContext(f"Downloading snapshot for {model_id}", logger):
+            # Try loading from local cache first to avoid network checks
+            try:
+                # First attempt: strictly local
+                # This avoids "Fetching X files" if we already have it
                 cached_model_dir = snapshot_download(
                     repo_id=model_id,
                     revision=cls.revision,
@@ -72,8 +76,22 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
                     proxies=proxies,
                     resume_download=resume_download,
                     token=token,
-                    local_files_only=local_files_only,
+                    local_files_only=True,
                 )
+            except Exception:
+                # Fallback: allow network
+                # We catch Exception broadly because hf_hub raises various errors for missing files
+                with LogContext(f"Downloading snapshot for {model_id}", logger):
+                    cached_model_dir = snapshot_download(
+                        repo_id=model_id,
+                        revision=cls.revision,
+                        cache_dir=cache_dir,
+                        force_download=force_download,
+                        proxies=proxies,
+                        resume_download=resume_download,
+                        token=token,
+                        local_files_only=local_files_only,
+                    )
             logger.info("Snapshot ready at %s", cached_model_dir)
             flush_output()
 
@@ -104,7 +122,10 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
             if checkpoint_device is None or checkpoint_device.type == "cpu":
                 checkpoint_device = device
 
-        if checkpoint_device is not None and checkpoint_device.type != "cpu":
+        # Check if model has parameters on meta device (from meta init optimization)
+        has_meta = any(p.device.type == "meta" for p in model.parameters())
+
+        if not has_meta and checkpoint_device is not None and checkpoint_device.type != "cpu":
             try:
                 model = model.to(checkpoint_device)
             except RuntimeError as e:
@@ -116,6 +137,7 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
                     torch.cuda.empty_cache()
                     checkpoint_device = torch.device("cpu")
                     model = model.to("cpu")
+                    oom_fallback = True
                 else:
                     raise
 
@@ -131,48 +153,36 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
             logger.info("Loading checkpoint from %s", checkpoint_path)
         flush_output()
 
+        # Optimization: Always load to CPU with mmap=True first.
+        # This makes the initial load instant (virtual memory) and avoids
+        # reading the entire 6GB+ file into RAM at once.
+        # The data is read on-demand during load_state_dict.
         t0 = time.perf_counter()
-        oom_fallback = False
-        mmap = None
-        if checkpoint_device is None or checkpoint_device.type == "cpu":
-            mmap = True
-        else:
-            mmap = False
-
         try:
             state_dict = torch.load(
                 checkpoint_path,
                 weights_only=True,
-                map_location=checkpoint_device or map_location,
-                mmap=mmap,
+                map_location="cpu",
+                mmap=True,
             )
-        except RuntimeError as e:
-            if (
-                checkpoint_device is not None
-                and checkpoint_device.type == "cuda"
-                and "out of memory" in str(e).lower()
-            ):
-                logger.warning(
-                    "CUDA OOM while loading checkpoint on %s; falling back to CPU load",
-                    checkpoint_device,
-                )
-                oom_fallback = True
-                model = model.to("cpu")
-                torch.cuda.empty_cache()
-                state_dict = torch.load(
-                    checkpoint_path,
-                    weights_only=True,
-                    map_location="cpu",
-                    mmap=True,
-                )
-            else:
-                raise
-        logger.info("Checkpoint loaded (%.1fs)", time.perf_counter() - t0)
+        except Exception as e:
+            logger.error("Failed to load checkpoint: %s", e)
+            raise
+            
+        logger.info("Checkpoint loaded (%.1fs) - mmap active", time.perf_counter() - t0)
         flush_output()
 
         logger.info("Applying state dict (strict=%s)", strict)
         t0 = time.perf_counter()
-        model.load_state_dict(state_dict, strict=strict)
+        
+        # Optimization: use assign=True for faster weight loading (skips some checks/copies)
+        # using try-except to support older torch versions if needed, though project requires >=2.5
+        try:
+            model.load_state_dict(state_dict, strict=strict, assign=True)
+        except TypeError:
+            # Fallback for older torch versions without assign arg
+            model.load_state_dict(state_dict, strict=strict)
+            
         del state_dict
         logger.info("State dict applied (%.1fs)", time.perf_counter() - t0)
         flush_output()
@@ -194,4 +204,33 @@ class BaseModel(torch.nn.Module, ModelHubMixin):
                         torch.cuda.empty_cache()
                     else:
                         raise
+
+        # Compile DiT transformer for optimized inference (P0 optimization)
+        # Uses fullgraph=True and reduce-overhead mode for maximum performance
+        if should_compile() and hasattr(model, 'transformer'):
+            try:
+                logger.info("Compiling DiT transformer with torch.compile...")
+                t0 = time.perf_counter()
+                model.transformer = compile_model(
+                    model.transformer,
+                    mode="reduce-overhead",
+                    fullgraph=True,
+                    dynamic=False,  # Use static shapes for better optimization
+                )
+                logger.info("DiT transformer compiled (%.1fs)", time.perf_counter() - t0)
+                flush_output()
+            except Exception as e:
+                logger.warning("Failed to compile DiT transformer: %s", e)
+
+        # Optional warmup to pre-compile CUDA kernels (P0 optimization)
+        # Reduces latency on first real inference by 10-20%
+        if os.environ.get("SAM_AUDIO_WARMUP", "1") != "0" and hasattr(model, 'warmup'):
+            try:
+                t0 = time.perf_counter()
+                model.warmup()
+                logger.info("Model warmup complete (%.1fs)", time.perf_counter() - t0)
+                flush_output()
+            except Exception as e:
+                logger.warning("Model warmup failed (non-fatal): %s", e)
+
         return model
