@@ -90,43 +90,93 @@ def get_gpu_info(device_index: int = 0) -> GPUInfo | None:
             return None
 
 
-def estimate_model_vram(model_size: str) -> float:
+def estimate_model_vram(model_size: str, predict_spans: bool = True, verbose: bool = False) -> float:
     """
     Estimate VRAM requirements for a given model size.
 
     These estimates include:
     - Model parameters (fp16/bf16)
     - Activation memory during inference
-    - Audio codec and text encoder overhead
-    - Safety margin for PyTorch allocations
+    - Audio codec (DAC) overhead
+    - Text encoder (T5-base) overhead
+    - Span predictor (PE-AV Frame Large + SIGLIP) when enabled
+    - CLAP ranker (HTSAT-tiny + RoBERTa-base) overhead
+    - Safety margin for PyTorch allocations and memory fragmentation
 
     Args:
         model_size: One of 'small', 'base', 'large'.
+        predict_spans: Whether span prediction is enabled (loads additional model).
+        verbose: If True, print detailed VRAM breakdown.
 
     Returns:
         Estimated VRAM requirement in GB.
     """
-    # Parameter counts estimated from model configs (transformer dims/layers)
-    # Plus auxiliary models (codec, text encoder, rankers)
+    # Verified parameter counts from model architectures
+    # SAM-Audio: DiT transformer with varying dims/layers
     model_params = {
-        "small": 0.3e9,   # ~300M parameters
-        "base": 0.6e9,    # ~600M parameters
-        "large": 1.2e9,   # ~1.2B parameters
+        "small": 300e6,   # ~300M parameters (dim=1024, layers=12)
+        "base": 600e6,    # ~600M parameters (dim=1536, layers=16)
+        "large": 1200e6,  # ~1.2B parameters (dim=2048, layers=24)
     }
 
-    # Bytes per parameter (fp16 = 2, plus optimizer states during loading)
-    bytes_per_param = 2.5
+    # Bytes per parameter: fp16 weights = 2 bytes
+    # Plus activation memory during forward pass (~1.5x for ODE solver)
+    bytes_per_param = 2.0
+    activation_multiplier = 1.5
 
-    # Activation memory multiplier (sequence length dependent)
-    # For 30s audio at 16kHz with codec compression
-    activation_multiplier = 1.8
+    # Fixed overhead components (in GB):
+    # DAC audio codec: ~75M params → ~0.15GB weights + buffers
+    dac_codec_gb = 0.3
 
-    # Fixed overhead: codec, text encoder, auxiliary models
-    overhead_gb = 2.0
+    # T5-base text encoder: ~220M params → ~0.44GB weights + tokenizer/cache
+    t5_encoder_gb = 0.8
 
+    # Span predictor (PE-AV Frame Large): ~600M params (ViT-L + audio encoder)
+    # Plus SIGLIP text encoder loaded by perception_models
+    span_predictor_gb = 2.5 if predict_spans else 0.0
+
+    # CLAP ranker (loaded for text-based reranking):
+    # HTSAT-tiny audio encoder (~30M) + RoBERTa-base text (~125M) + fusion
+    # Note: CLAP is only loaded when reranking_candidates > 1, but we budget for it
+    clap_ranker_gb = 0.8
+
+    # PyTorch CUDA memory fragmentation and allocation overhead
+    fragmentation_gb = 1.0
+
+    # Calculate model VRAM
     params = model_params.get(model_size, model_params["small"])
-    model_gb = (params * bytes_per_param) / (1024**3)
-    total_gb = (model_gb * activation_multiplier) + overhead_gb
+    model_weights_gb = (params * bytes_per_param) / (1024**3)
+    model_activations_gb = model_weights_gb * (activation_multiplier - 1)
+    model_total_gb = model_weights_gb + model_activations_gb
+
+    # Sum all components
+    total_gb = (
+        model_total_gb +
+        dac_codec_gb +
+        t5_encoder_gb +
+        span_predictor_gb +
+        clap_ranker_gb +
+        fragmentation_gb
+    )
+
+    if verbose:
+        print(f"\n{'─' * 50}")
+        print(f"VRAM Estimation for SAM-Audio {model_size}")
+        print(f"{'─' * 50}")
+        print(f"  SAM-Audio model ({model_size}):  {model_total_gb:>6.2f} GB")
+        print(f"    - Weights ({params/1e6:.0f}M params):    {model_weights_gb:>6.2f} GB")
+        print(f"    - Activations:              {model_activations_gb:>6.2f} GB")
+        print(f"  DAC audio codec:              {dac_codec_gb:>6.2f} GB")
+        print(f"  T5-base text encoder:         {t5_encoder_gb:>6.2f} GB")
+        if predict_spans:
+            print(f"  Span predictor (PE-AV):       {span_predictor_gb:>6.2f} GB")
+        else:
+            print(f"  Span predictor:               (disabled)")
+        print(f"  CLAP ranker (budgeted):       {clap_ranker_gb:>6.2f} GB")
+        print(f"  Fragmentation overhead:       {fragmentation_gb:>6.2f} GB")
+        print(f"{'─' * 50}")
+        print(f"  TOTAL ESTIMATED:              {total_gb:>6.2f} GB")
+        print(f"{'─' * 50}\n")
 
     return total_gb
 
@@ -275,7 +325,12 @@ def prompt_process_termination(processes: list[GPUProcess]) -> bool:
     return terminated
 
 
-def select_model(gpu_info: GPUInfo | None, safety_margin: float = 0.9) -> str:
+def select_model(
+    gpu_info: GPUInfo | None,
+    predict_spans: bool = True,
+    safety_margin: float = 0.9,
+    verbose: bool = False,
+) -> str:
     """
     Select the appropriate SAM-Audio model based on GPU VRAM.
 
@@ -284,23 +339,35 @@ def select_model(gpu_info: GPUInfo | None, safety_margin: float = 0.9) -> str:
 
     Args:
         gpu_info: GPU information or None for CPU.
+        predict_spans: Whether span prediction is enabled (affects VRAM requirements).
         safety_margin: Use only this fraction of available VRAM (default 90%).
+        verbose: If True, print detailed VRAM estimation breakdown.
 
     Returns:
         HuggingFace model path string.
     """
     if gpu_info is None:
+        if verbose:
+            print("No GPU detected, selecting smallest model for CPU inference.")
         return "facebook/sam-audio-small"
 
-    available_vram = gpu_info.vram_gb * safety_margin
+    available_vram = gpu_info.available_vram_gb * safety_margin
+    if verbose:
+        print(f"\nAvailable VRAM: {gpu_info.available_vram_gb:.2f} GB (using {safety_margin*100:.0f}% = {available_vram:.2f} GB)")
 
     # Try models from largest to smallest
     for size in ["large", "base", "small"]:
-        required = estimate_model_vram(size)
+        required = estimate_model_vram(size, predict_spans=predict_spans, verbose=verbose)
         if available_vram >= required:
+            if verbose:
+                print(f"✓ Selected: facebook/sam-audio-{size} (requires {required:.2f} GB)")
             return f"facebook/sam-audio-{size}"
+        elif verbose:
+            print(f"✗ Skipping: facebook/sam-audio-{size} (requires {required:.2f} GB, exceeds available)")
 
     # Fall back to small if nothing fits (will likely OOM, but user can try)
+    if verbose:
+        print("⚠ Warning: No model fits comfortably. Using 'small' but may OOM.")
     return "facebook/sam-audio-small"
 
 
@@ -408,6 +475,11 @@ Examples:
         action="store_true",
         help="Skip interactive prompts (e.g., process termination).",
     )
+    parser.add_argument(
+        "--log-vram",
+        action="store_true",
+        help="Print detailed VRAM estimation breakdown during model selection.",
+    )
 
     args = parser.parse_args()
 
@@ -444,8 +516,13 @@ Examples:
             print("No GPU detected, using CPU")
 
     # Select model
-    model_path = args.model or select_model(gpu_info)
-    if args.verbose:
+    log_vram = args.log_vram or args.verbose
+    model_path = args.model or select_model(
+        gpu_info,
+        predict_spans=args.predict_spans,
+        verbose=log_vram
+    )
+    if args.verbose and not log_vram:
         print(f"Using model: {model_path}")
 
     # Select reranking candidates
