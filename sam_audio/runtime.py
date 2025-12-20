@@ -5,6 +5,7 @@ from functools import lru_cache
 from typing import Optional
 
 import torch
+from sam_audio.metrics import log_metric
 
 
 def _env_truthy(name: str, default: bool) -> bool:
@@ -202,13 +203,13 @@ def clear_cuda_cache(log: bool = True) -> None:
         try:
             allocated_after = torch.cuda.memory_allocated() / (1024**3)
             reserved_after = torch.cuda.memory_reserved() / (1024**3)
-            from sam_audio.logging_config import get_logger
             logger = get_logger(__name__)
             logger.debug(
                 "CUDA cache cleared: allocated %.2f->%.2f GB, reserved %.2f->%.2f GB",
                 allocated_before, allocated_after,
                 reserved_before, reserved_after,
             )
+            log_metric("cuda_cache_freed", reserved_before - reserved_after, "GB")
         except Exception:
             pass
 

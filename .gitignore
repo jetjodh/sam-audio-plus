@@ -7,3 +7,5 @@ dist
 .checkpoints
 .ipynb_checkpoints
 .agent/
+logs/
+metrics_logs/

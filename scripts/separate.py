@@ -446,14 +446,8 @@ Examples:
     parser.add_argument(
         "--predict-spans",
         action="store_true",
-        default=True,
-        help="Enable span prediction (default: enabled).",
-    )
-    parser.add_argument(
-        "--no-predict-spans",
-        action="store_false",
-        dest="predict_spans",
-        help="Disable span prediction.",
+        default=False,
+        help="Enable span prediction (default: disabled to save VRAM).",
     )
     parser.add_argument(
         "-c", "--candidates",
@@ -501,8 +495,31 @@ Examples:
         default=1.0,
         help="Amount of VRAM (GB) to leave free for desktop responsiveness (default: 1.0).",
     )
+    parser.add_argument(
+        "--metrics-json",
+        type=Path,
+        default=None,
+        help="Path to save performance metrics in JSON format.",
+    )
+    parser.add_argument(
+        "--no-metrics",
+        action="store_true",
+        help="Disable performance metrics collection.",
+    )
 
     args = parser.parse_args()
+
+    # Set up metrics
+    from sam_audio.metrics import get_metrics_collector
+    # Enable metrics unless disabled by flag or env var (metrics module checks env var by default)
+    # If explicitly disabled by flag, force disable
+    if args.no_metrics:
+        get_metrics_collector().enabled = False
+    
+    # Start total execution timer and monitoring
+    collector = get_metrics_collector()
+    collector.start_timer("total_execution_time")
+    collector.start_monitoring(interval=0.5)
 
     # Set up logging early (before any model imports)
     from sam_audio.logging_config import setup_logging, get_logger, flush_output
@@ -589,8 +606,7 @@ Examples:
     flush_output()
     model = SAMAudio.from_pretrained(model_path)
     model = model.eval()
-    if device.type == "cuda":
-        model = model.cuda()
+    model = model.to(device)
 
     processor = SAMAudioProcessor.from_pretrained(model_path)
 
@@ -630,9 +646,32 @@ Examples:
 
     logger.info("Target saved to: %s", output_target)
     logger.info("Residual saved to: %s", output_residual)
-    print(f"Target saved to: {output_target}")
     print(f"Residual saved to: {output_residual}")
     flush_output()
+
+    # Stop execution timer and report metrics
+    collector.stop_timer("total_execution_time")
+    collector.stop_monitoring()
+    
+    # Print metrics report
+    if collector.enabled:
+        print(collector.get_report_table())
+        
+        # Determine JSON output path
+        json_path = args.metrics_json
+        if not json_path and not args.no_metrics:
+            # Auto-generate path if not specified
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            log_dir = Path("logs/metrics")
+            log_dir.mkdir(parents=True, exist_ok=True)
+            json_path = log_dir / f"metrics_{timestamp}_{stem}.json"
+            
+        # Export JSON
+        if json_path:
+            collector.export_json(str(json_path))
+            logger.info("Metrics saved to: %s", json_path)
+            print(f"Metrics saved to: {json_path}")
 
     return 0
 

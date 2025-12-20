@@ -25,6 +25,7 @@ from sam_audio.model.transformer import DiT
 from sam_audio.model.vision_encoder import PerceptionEncoder
 from sam_audio.processor import Batch
 from sam_audio.ranking import create_ranker
+from sam_audio.metrics import measure_time, log_memory 
 
 # ODE preset names
 ODEPreset = Literal["fast", "balanced", "quality", "max_quality"]
@@ -276,18 +277,19 @@ class SAMAudio(BaseModel):
     def predict_spans(
         self, batch: Batch, audio_features: torch.Tensor, audio_pad_mask: torch.Tensor
     ) -> Batch:
-        input = self.span_predictor_transform(text=batch.descriptions).to(
-            audio_features.device
-        )
-        output = self.span_predictor(
-            input_features=audio_features[:, :, :128],
-            padding_mask=audio_pad_mask,
-            return_spans=True,
-            **input,
-        )
-        anchors = [[["+"] + anchor for anchor in anchors]
-                   for anchors in output.spans]
-        batch.process_anchors(anchors)
+        with measure_time("span_prediction_time"):
+            input = self.span_predictor_transform(text=batch.descriptions).to(
+                audio_features.device
+            )
+            output = self.span_predictor(
+                input_features=audio_features[:, :, :128],
+                padding_mask=audio_pad_mask,
+                return_spans=True,
+                **input,
+            )
+            anchors = [[["+"] + anchor for anchor in anchors]
+                       for anchors in output.spans]
+            batch.process_anchors(anchors)
         return batch
 
     @torch.inference_mode()
@@ -319,18 +321,23 @@ class SAMAudio(BaseModel):
             ode_opt = get_ode_options(ode_preset)
 
         device = batch.audios.device
+        
+        # Log VRAM before starting major operations
+        log_memory("inference_start_vram", device)
+        
         # Encode audio/text/video (keep state tensors float32; AMP is applied in compute-heavy ops)
-        with autocast_context(device=device):
-            audio_features = self.audio_codec(batch.audios).transpose(1, 2)
-        audio_features = audio_features.float()
-        audio_features = torch.cat([audio_features, audio_features], dim=2)
-
-        text_features, text_mask = self.text_encoder(batch.descriptions)
-        with autocast_context(device=device):
-            masked_video_features = self._get_video_features(
-                batch.masked_video, audio_features
-            )
-        masked_video_features = masked_video_features.float()
+        with measure_time("encoding_time"):
+            with autocast_context(device=device):
+                audio_features = self.audio_codec(batch.audios).transpose(1, 2)
+            audio_features = audio_features.float()
+            audio_features = torch.cat([audio_features, audio_features], dim=2)
+    
+            text_features, text_mask = self.text_encoder(batch.descriptions)
+            with autocast_context(device=device):
+                masked_video_features = self._get_video_features(
+                    batch.masked_video, audio_features
+                )
+            masked_video_features = masked_video_features.float()
 
         forward_args = {
             "audio_features": self._repeat_for_reranking(audio_features, reranking_candidates),
@@ -376,19 +383,24 @@ class SAMAudio(BaseModel):
                 )
             return res
 
-        states = odeint(
-            vector_field,
-            noise,
-            torch.tensor([0.0, 1.0], device=noise.device),
-            **ode_opt,
-        )
+        log_memory("pre_ode_vram", device)
+
+        with measure_time("ode_solver_time"):
+            states = odeint(
+                vector_field,
+                noise,
+                torch.tensor([0.0, 1.0], device=noise.device),
+                **ode_opt,
+            )
+            
         generated_features = states[-1].transpose(1, 2)
         # generated_features has shape [B, 2C, T].  Reshape to stack along the batch dimension
-        with autocast_context(device=generated_features.device):
-            wavs = self.audio_codec.decode(
-                generated_features.reshape(2 * B, C, T)
-            ).view(B, 2, -1)
-        wavs = wavs.float()
+        with measure_time("decoding_time"):
+            with autocast_context(device=generated_features.device):
+                wavs = self.audio_codec.decode(
+                    generated_features.reshape(2 * B, C, T)
+                ).view(B, 2, -1)
+            wavs = wavs.float()
 
         bsz = wavs.size(0) // reranking_candidates
         sizes = self.audio_codec.feature_idx_to_wav_idx(batch.sizes)
@@ -399,32 +411,35 @@ class SAMAudio(BaseModel):
             wavs[:, 1].view(bsz, reranking_candidates, -1), sizes
         )
 
-        if reranking_candidates > 1 and batch.masked_video is not None:
-            visual_ranker = self._get_visual_ranker()
-        else:
-            visual_ranker = None
+        with measure_time("reranking_time"):
+            if reranking_candidates > 1 and batch.masked_video is not None:
+                visual_ranker = self._get_visual_ranker()
+            else:
+                visual_ranker = None
+    
+            if reranking_candidates > 1 and visual_ranker is not None:
+                scores = visual_ranker(
+                    extracted_audio=target_wavs,
+                    videos=batch.masked_video,
+                    sample_rate=self.audio_codec.sample_rate,
+                )
+                idxs = scores.argmax(dim=1)
+            elif reranking_candidates > 1 and self._get_text_ranker() is not None:
+                input_audio = [
+                    audio[:, :size].expand(reranking_candidates, -1)
+                    for audio, size in zip(batch.audios, sizes, strict=False)
+                ]
+                scores = self._get_text_ranker()(
+                    extracted_audio=target_wavs,
+                    input_audio=input_audio,
+                    descriptions=batch.descriptions,
+                    sample_rate=self.audio_codec.sample_rate,
+                )
+                idxs = scores.argmax(dim=1)
+            else:
+                idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
 
-        if reranking_candidates > 1 and visual_ranker is not None:
-            scores = visual_ranker(
-                extracted_audio=target_wavs,
-                videos=batch.masked_video,
-                sample_rate=self.audio_codec.sample_rate,
-            )
-            idxs = scores.argmax(dim=1)
-        elif reranking_candidates > 1 and self._get_text_ranker() is not None:
-            input_audio = [
-                audio[:, :size].expand(reranking_candidates, -1)
-                for audio, size in zip(batch.audios, sizes, strict=False)
-            ]
-            scores = self._get_text_ranker()(
-                extracted_audio=target_wavs,
-                input_audio=input_audio,
-                descriptions=batch.descriptions,
-                sample_rate=self.audio_codec.sample_rate,
-            )
-            idxs = scores.argmax(dim=1)
-        else:
-            idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
+        log_memory("post_inference_vram", device)
 
         return SeparationResult(
             target=[wav[idx]
