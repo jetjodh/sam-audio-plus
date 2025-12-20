@@ -340,6 +340,9 @@ def prompt_process_termination(processes: list[GPUProcess]) -> bool:
     print("Would you like to terminate any processes to free up VRAM?")
     print("Enter PID(s) separated by commas, or press Enter to skip: ", end="")
 
+    if not sys.stdin.isatty():
+        return False
+
     try:
         user_input = input().strip()
     except (EOFError, KeyboardInterrupt):
@@ -577,11 +580,15 @@ Examples:
     # Set up logging early (before any model imports)
     from sam_audio.logging_config import setup_logging, get_logger, flush_output
     log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    
+    # Default log directory
+    log_dir = args.log_dir or Path("logs")
+    
     setup_logging(
-        log_dir=args.log_dir,
+        log_dir=log_dir,
         log_level=log_level,
-        enable_console=args.verbose,
-        enable_file=args.log_dir is not None,
+        enable_console=True, # Always show logs on console
+        enable_file=True, # Always save logs to file (defaults to logs/sam_audio.log)
     )
     logger = get_logger(__name__)
 

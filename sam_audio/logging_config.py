@@ -50,8 +50,9 @@ def setup_logging(
     if isinstance(log_level, str):
         log_level = getattr(logging, log_level.upper(), logging.INFO)
 
-    # Get root logger for sam_audio
-    root_logger = logging.getLogger("sam_audio")
+    # Get logger to configure. Use empty string for root logger to catch everything
+    # including scripts not under the 'sam_audio' package namespace.
+    root_logger = logging.getLogger("")
     root_logger.setLevel(log_level)
 
     # Remove existing handlers to avoid duplicates
