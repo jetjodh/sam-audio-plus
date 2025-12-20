@@ -1,5 +1,8 @@
+import gc
 import os
 from contextlib import nullcontext
+from functools import lru_cache
+from typing import Optional
 
 import torch
 
@@ -9,6 +12,67 @@ def _env_truthy(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value not in {"0", "false", "False", "no", "NO"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
+
+
+@lru_cache(maxsize=1)
+def _supports_compile() -> bool:
+    """Check if torch.compile is available and functional."""
+    if not hasattr(torch, "compile"):
+        return False
+    # Require PyTorch 2.0+
+    major = int(torch.__version__.split(".")[0])
+    return major >= 2
+
+
+def should_compile() -> bool:
+    """Check if model compilation is enabled and supported."""
+    if not _supports_compile():
+        return False
+    return _env_truthy("SAM_AUDIO_COMPILE", default=True)
+
+
+def compile_model(
+    model: torch.nn.Module,
+    *,
+    mode: str = "reduce-overhead",
+    fullgraph: bool = False,
+    dynamic: bool = True,
+) -> torch.nn.Module:
+    """
+    Compile a model with torch.compile for optimized inference.
+
+    Args:
+        model: PyTorch model to compile.
+        mode: Compilation mode ('default', 'reduce-overhead', 'max-autotune').
+        fullgraph: If True, require full graph compilation.
+        dynamic: If True, enable dynamic shape support.
+
+    Returns:
+        Compiled model, or original model if compilation unavailable.
+    """
+    if not should_compile():
+        return model
+
+    try:
+        return torch.compile(
+            model,
+            mode=mode,
+            fullgraph=fullgraph,
+            dynamic=dynamic,
+        )
+    except Exception:
+        # Fallback to uncompiled model on any compilation error
+        return model
 
 
 def get_default_device() -> torch.device:
@@ -148,3 +212,74 @@ def clear_cuda_cache(log: bool = True) -> None:
         except Exception:
             pass
 
+
+# ODE solver presets for speed vs quality tradeoffs
+ODE_PRESETS = {
+    "fast": {"method": "euler", "options": {"step_size": 1 / 8}},  # 8 steps
+    "balanced": {"method": "midpoint", "options": {"step_size": 1 / 16}},  # 16 steps
+    "quality": {"method": "midpoint", "options": {"step_size": 2 / 32}},  # 16 steps (original)
+    "max_quality": {"method": "dopri5", "rtol": 1e-3, "atol": 1e-5},  # adaptive
+}
+
+
+def get_ode_options(preset: str = "quality") -> dict:
+    """
+    Get ODE solver options for the specified preset.
+
+    Args:
+        preset: One of 'fast', 'balanced', 'quality', 'max_quality'.
+                Can also be overridden via SAM_AUDIO_ODE_PRESET env var.
+
+    Returns:
+        Dictionary of ODE solver options for torchdiffeq.odeint.
+    """
+    env_preset = os.environ.get("SAM_AUDIO_ODE_PRESET")
+    if env_preset is not None:
+        preset = env_preset.lower().strip()
+
+    if preset not in ODE_PRESETS:
+        preset = "quality"
+
+    # Allow step override via environment
+    env_steps = _env_int("SAM_AUDIO_ODE_STEPS", 0)
+    if env_steps > 0:
+        options = ODE_PRESETS[preset].copy()
+        if "options" in options:
+            options["options"] = options["options"].copy()
+            options["options"]["step_size"] = 1 / env_steps
+        return options
+
+    return ODE_PRESETS[preset]
+
+
+def prefetch_cuda_info(device: torch.device | None = None) -> None:
+    """
+    Pre-warm CUDA device info queries to avoid first-call latency.
+
+    Args:
+        device: Target CUDA device. Uses default if None.
+    """
+    device = device or get_default_device()
+    if device.type != "cuda":
+        return
+
+    # Warm up device properties cache
+    try:
+        _ = torch.cuda.get_device_properties(device)
+        _ = torch.cuda.get_device_capability(device)
+        _ = torch.cuda.memory_allocated(device)
+        _ = torch.cuda.memory_reserved(device)
+    except Exception:
+        pass
+
+
+def synchronize_cuda(device: torch.device | None = None) -> None:
+    """
+    Synchronize CUDA stream if on GPU.
+
+    Args:
+        device: Target CUDA device. Uses default if None.
+    """
+    device = device or get_default_device()
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)

@@ -1,15 +1,21 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
+# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
 import math
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Literal
 
 import torch
 from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
 from torchdiffeq import odeint
 
-from sam_audio.runtime import autocast_context
+from sam_audio.runtime import (
+    autocast_context,
+    clear_cuda_cache,
+    compile_model,
+    get_ode_options,
+    should_compile,
+)
 from sam_audio.model.align import AlignModalities
 from sam_audio.model.base import BaseModel
 from sam_audio.model.codec import DACVAE
@@ -20,7 +26,8 @@ from sam_audio.model.vision_encoder import PerceptionEncoder
 from sam_audio.processor import Batch
 from sam_audio.ranking import create_ranker
 
-DFLT_ODE_OPT = {"method": "midpoint", "options": {"step_size": 2 / 32}}
+# ODE preset names
+ODEPreset = Literal["fast", "balanced", "quality", "max_quality"]
 
 
 class SinusoidalEmbedding(torch.nn.Module):
@@ -288,10 +295,29 @@ class SAMAudio(BaseModel):
         self,
         batch: Batch,
         noise: Optional[torch.Tensor] = None,
-        ode_opt: Dict[str, Any] = DFLT_ODE_OPT,
+        ode_opt: Optional[Dict[str, Any]] = None,
+        ode_preset: ODEPreset = "quality",
         reranking_candidates: int = 1,
         predict_spans: bool = False,
     ) -> SeparationResult:
+        """
+        Separate target audio from mixture.
+
+        Args:
+            batch: Processed input batch.
+            noise: Optional initial noise tensor.
+            ode_opt: ODE solver options dict. If None, uses ode_preset.
+            ode_preset: ODE solver preset ('fast', 'balanced', 'quality', 'max_quality').
+            reranking_candidates: Number of candidates for reranking.
+            predict_spans: Whether to predict time spans for anchoring.
+
+        Returns:
+            SeparationResult with target, residual, and noise tensors.
+        """
+        # Resolve ODE options
+        if ode_opt is None:
+            ode_opt = get_ode_options(ode_preset)
+
         device = batch.audios.device
         # Encode audio/text/video (keep state tensors float32; AMP is applied in compute-heavy ops)
         with autocast_context(device=device):
@@ -414,6 +440,37 @@ class SAMAudio(BaseModel):
         for row, size in zip(wavs, sizes, strict=False):
             result.append(row.narrow(dim=time_dim, start=0, length=size))
         return result
+
+    @torch.inference_mode()
+    def separate_fast(
+        self,
+        batch: Batch,
+        noise: Optional[torch.Tensor] = None,
+        reranking_candidates: int = 1,
+        predict_spans: bool = False,
+    ) -> SeparationResult:
+        """
+        Fast audio separation using reduced ODE steps.
+
+        This is a convenience wrapper around separate() with the 'fast' preset.
+        Trades some quality for ~2-4x faster inference.
+
+        Args:
+            batch: Processed input batch.
+            noise: Optional initial noise tensor.
+            reranking_candidates: Number of candidates for reranking.
+            predict_spans: Whether to predict time spans for anchoring.
+
+        Returns:
+            SeparationResult with target, residual, and noise tensors.
+        """
+        return self.separate(
+            batch=batch,
+            noise=noise,
+            ode_preset="fast",
+            reranking_candidates=reranking_candidates,
+            predict_spans=predict_spans,
+        )
 
     def load_state_dict(self, state_dict, strict=True):
         if strict:

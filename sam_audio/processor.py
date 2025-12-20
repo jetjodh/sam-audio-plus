@@ -4,6 +4,8 @@ import json
 import math
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -18,26 +20,60 @@ from sam_audio.model.config import SAMAudioConfig, SAMAudioJudgeConfig
 
 logger = get_logger(__name__)
 
-
+# Configuration
+_MAX_AUDIO_WORKERS = int(os.environ.get("SAM_AUDIO_MAX_WORKERS", "4"))
 
 Anchor = Tuple[str, float, float]
 
 
+def _load_single_audio(
+    audio: str | torch.Tensor,
+    audio_sampling_rate: int,
+) -> torch.Tensor:
+    """Load a single audio file or return tensor."""
+    if isinstance(audio, str):
+        decoder = AudioDecoder(
+            audio,
+            sample_rate=audio_sampling_rate,
+            num_channels=1,
+        )
+        wav = decoder.get_all_samples().data
+    else:
+        wav = audio
+    return wav.mean(0)
+
+
 def batch_audio(
-    audios: list[str | torch.Tensor], audio_sampling_rate: int = 48_000
+    audios: list[str | torch.Tensor],
+    audio_sampling_rate: int = 48_000,
+    parallel: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    wavs = []
-    for audio in audios:
-        if isinstance(audio, str):
-            decoder = AudioDecoder(
-                audio,
-                sample_rate=audio_sampling_rate,
-                num_channels=1,
-            )
-            wav = decoder.get_all_samples().data
-        else:
-            wav = audio
-        wavs.append(wav.mean(0))
+    """
+    Batch audio files into a padded tensor.
+
+    Args:
+        audios: List of audio file paths or tensors.
+        audio_sampling_rate: Target sample rate.
+        parallel: Use parallel loading for file paths.
+
+    Returns:
+        Tuple of (batched audios, sizes tensor).
+    """
+    # Check if we can parallelize (only file paths benefit)
+    file_paths = [a for a in audios if isinstance(a, str)]
+    use_parallel = parallel and len(file_paths) > 1
+
+    if use_parallel:
+        # Parallel loading for file paths
+        with ThreadPoolExecutor(max_workers=min(_MAX_AUDIO_WORKERS, len(audios))) as executor:
+            wavs = list(executor.map(
+                lambda a: _load_single_audio(a, audio_sampling_rate),
+                audios
+            ))
+    else:
+        # Sequential loading
+        wavs = [_load_single_audio(a, audio_sampling_rate) for a in audios]
+
     device = wavs[0].device if len(wavs) > 0 else None
     sizes = torch.tensor(
         [wav.size(-1) for wav in wavs],

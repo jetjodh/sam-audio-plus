@@ -34,13 +34,16 @@ def get_nonlinearity(kind: str):
 
 
 class RMSNorm(torch.nn.Module):
+    """Root Mean Square Layer Normalization with torch.compile-friendly ops."""
+
     def __init__(self, dim: int, eps: float = 1e-5):
         super().__init__()
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(dim))
 
     def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+        # Use torch.mean for better kernel fusion with torch.compile
+        return x * torch.rsqrt(torch.mean(x * x, dim=-1, keepdim=True) + self.eps)
 
     def forward(self, x):
         output = self._norm(x.float())
@@ -81,6 +84,8 @@ class ProjectionLayer(torch.nn.Module):
 
 
 class Attention(nn.Module):
+    """Multi-head attention with flash attention support."""
+
     def __init__(
         self,
         dim: int,
@@ -98,6 +103,7 @@ class Attention(nn.Module):
         self.n_heads = n_heads
         self.n_kv_heads = n_kv_heads
         self.use_qk_norm = use_qk_norm
+        self._scale = head_dim**-0.5
 
         self.wq = torch.nn.Linear(dim, n_heads * head_dim, bias=fc_bias)
         self.wk, self.wv = [
@@ -120,10 +126,8 @@ class Attention(nn.Module):
 
     def reshape_heads(self, x: torch.Tensor, heads: int) -> torch.Tensor:
         B, T, C = x.shape
-        # B x T x C -> B x T x C/H x H
-        x = x.reshape(B, T, C // heads, heads)
-        # B x T x C/H x H -> B x H x T x C/H
-        return x.permute(0, 3, 1, 2)
+        # B x T x C -> B x T x H x D -> B x H x T x D
+        return x.view(B, T, heads, C // heads).transpose(1, 2)
 
     def forward(
         self,
@@ -155,7 +159,10 @@ class Attention(nn.Module):
         if key_padding_mask is not None:
             attn_mask = key_padding_mask[:, None, None, :]
 
-        output = F.scaled_dot_product_attention(xq, xk, xv, attn_mask=attn_mask)
+        # Use scaled_dot_product_attention for flash attention when available
+        output = F.scaled_dot_product_attention(
+            xq, xk, xv, attn_mask=attn_mask, scale=self._scale
+        )
 
         output = rearrange(output, "b h n d -> b n (h d)")
         return self.wo(output)

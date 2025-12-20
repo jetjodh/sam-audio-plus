@@ -1,4 +1,7 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
+# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
+
+import os
+from typing import Optional
 
 import torch
 import torchaudio
@@ -7,6 +10,10 @@ from huggingface_hub import hf_hub_download
 from sam_audio.model.config import ClapRankerConfig
 from sam_audio.runtime import auto_tune
 from sam_audio.ranking.ranker import Ranker
+
+
+# Cache size for text embeddings (0 = disabled)
+_CLAP_TEXT_CACHE_SIZE = int(os.environ.get("SAM_AUDIO_CLAP_CACHE_SIZE", "64"))
 
 
 def get_model(checkpoint_file=None, device="cpu"):
@@ -39,6 +46,8 @@ def get_model(checkpoint_file=None, device="cpu"):
 
 
 class ClapRanker(Ranker):
+    """CLAP-based audio-text ranker with text embedding caching."""
+
     def __init__(self, config: ClapRankerConfig):
         from laion_clap.training import data
 
@@ -46,6 +55,35 @@ class ClapRanker(Ranker):
         super().__init__()
         self.config = config
         self.model = get_model(checkpoint_file=config.checkpoint)
+        # Text embedding cache
+        self._text_cache: dict[str, torch.Tensor] = {}
+        self._cache_enabled = _CLAP_TEXT_CACHE_SIZE > 0
+
+    def clear_cache(self) -> None:
+        """Clear the text embedding cache."""
+        self._text_cache.clear()
+
+    def _get_text_embedding_cached(
+        self, descriptions: list[str]
+    ) -> torch.Tensor:
+        """Get text embeddings with caching for single descriptions."""
+        if not self._cache_enabled or len(descriptions) != 1:
+            return self.model.get_text_embedding(descriptions, use_tensor=True)
+
+        desc = descriptions[0]
+        if desc in self._text_cache:
+            return self._text_cache[desc].unsqueeze(0)
+
+        # Compute and cache
+        embed = self.model.get_text_embedding(descriptions, use_tensor=True)
+
+        if len(self._text_cache) >= _CLAP_TEXT_CACHE_SIZE:
+            # Simple LRU: remove oldest entry
+            oldest_key = next(iter(self._text_cache))
+            del self._text_cache[oldest_key]
+
+        self._text_cache[desc] = embed.squeeze(0)
+        return embed
 
     def _prepare_audio(self, audio, sample_rate):
         audio_features = []
@@ -85,8 +123,7 @@ class ClapRanker(Ranker):
         audio_embed = self.model.model.get_audio_embedding(
             self._prepare_audio(extracted_audio, sample_rate)
         )
-        text_embed = self.model.get_text_embedding(
-            descriptions, use_tensor=True)
+        text_embed = self._get_text_embedding_cached(descriptions)
         bsz = len(extracted_audio)
         candidates = len(audio_embed) // bsz
         audio_embed = audio_embed.reshape(bsz, candidates, -1)
