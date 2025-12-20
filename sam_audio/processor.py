@@ -1,7 +1,6 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
+# Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved
 
 import json
-import logging
 import math
 import os
 import time
@@ -14,19 +13,11 @@ from torch.nn.utils.rnn import pad_sequence
 from torchcodec.decoders import AudioDecoder, VideoDecoder
 from transformers import AutoTokenizer, BatchFeature
 
+from sam_audio.logging_config import flush_output, get_logger
 from sam_audio.model.config import SAMAudioConfig, SAMAudioJudgeConfig
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-
-def _emit_load_progress(message: str, *args):
-    logger.info(message, *args)
-    if os.environ.get("SAM_AUDIO_LOAD_VERBOSE") == "1":
-        try:
-            text = message % args if args else message
-        except Exception:
-            text = f"{message} {args}"
-        print(f"[{__name__}] {text}", flush=True)
 
 
 Anchor = Tuple[str, float, float]
@@ -191,23 +182,25 @@ class Processor:
             config_path = os.path.join(model_name_or_path, "config.json")
         else:
             t0 = time.perf_counter()
-            _emit_load_progress(
+            logger.info(
                 "Downloading config.json for %s (revision=%s)",
                 model_name_or_path,
                 cls.revision,
             )
+            flush_output()
             config_path = hf_hub_download(
                 repo_id=model_name_or_path,
                 filename="config.json",
                 revision=cls.revision,
             )
-            _emit_load_progress(
+            logger.info(
                 "config.json downloaded for %s to %s (%.1fs)",
                 model_name_or_path,
                 config_path,
                 time.perf_counter() - t0,
             )
-        _emit_load_progress("Reading config.json from %s", config_path)
+            flush_output()
+        logger.info("Reading config.json from %s", config_path)
         with open(config_path) as fin:
             config = cls.config_cls(**json.load(fin))
         return config

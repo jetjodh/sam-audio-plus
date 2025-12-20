@@ -118,16 +118,25 @@ class SAMAudio(BaseModel):
             self.span_predictor_transform = PEAudioFrameTransform.from_config(
                 self._span_predictor_cfg
             )
+            # Move span predictor to the same device as the model
+            device = next(self.parameters()).device
+            self.span_predictor = self.span_predictor.to(device)
         return self.span_predictor
 
     def _get_visual_ranker(self):
         if self.visual_ranker is None and self._visual_ranker_cfg is not None:
             self.visual_ranker = create_ranker(self._visual_ranker_cfg)
+            # Move ranker to the same device as the model
+            device = next(self.parameters()).device
+            self.visual_ranker = self.visual_ranker.to(device)
         return self.visual_ranker
 
     def _get_text_ranker(self):
         if self.text_ranker is None and self._text_ranker_cfg is not None:
             self.text_ranker = create_ranker(self._text_ranker_cfg)
+            # Move ranker to the same device as the model
+            device = next(self.parameters()).device
+            self.text_ranker = self.text_ranker.to(device)
         return self.text_ranker
 
     @property

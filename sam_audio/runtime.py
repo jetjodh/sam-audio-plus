@@ -86,3 +86,65 @@ def autocast_context(
 
     dtype = dtype or get_autocast_dtype(device) or torch.float16
     return torch.autocast(device_type="cuda", dtype=dtype)
+
+
+def optimize_cuda_allocator(device: torch.device | None = None) -> None:
+    """
+    Optimize CUDA memory allocator for better fragmentation handling.
+
+    Args:
+        device: Target CUDA device. Uses default if None.
+    """
+    device = device or get_default_device()
+    if device.type != "cuda":
+        return
+
+    # Use expandable segments for better large allocation handling
+    if hasattr(torch.cuda.memory, "set_per_process_memory_fraction"):
+        # Leave some memory for the system (95% max usage)
+        try:
+            torch.cuda.memory.set_per_process_memory_fraction(0.95, device)
+        except RuntimeError:
+            pass  # Already set or not supported
+
+    # Enable memory-efficient allocator settings
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+
+def clear_cuda_cache(log: bool = True) -> None:
+    """
+    Clear CUDA memory cache and run garbage collection.
+
+    Args:
+        log: Whether to log memory usage before/after clearing.
+    """
+    if not torch.cuda.is_available():
+        return
+
+    import gc
+
+    if log:
+        try:
+            allocated_before = torch.cuda.memory_allocated() / (1024**3)
+            reserved_before = torch.cuda.memory_reserved() / (1024**3)
+        except Exception:
+            log = False
+
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+
+    if log:
+        try:
+            allocated_after = torch.cuda.memory_allocated() / (1024**3)
+            reserved_after = torch.cuda.memory_reserved() / (1024**3)
+            from sam_audio.logging_config import get_logger
+            logger = get_logger(__name__)
+            logger.debug(
+                "CUDA cache cleared: allocated %.2f->%.2f GB, reserved %.2f->%.2f GB",
+                allocated_before, allocated_after,
+                reserved_before, reserved_after,
+            )
+        except Exception:
+            pass
+

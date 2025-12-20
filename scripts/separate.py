@@ -15,10 +15,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import signal
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -328,7 +329,7 @@ def prompt_process_termination(processes: list[GPUProcess]) -> bool:
 def select_model(
     gpu_info: GPUInfo | None,
     predict_spans: bool = True,
-    safety_margin: float = 0.9,
+    vram_reserve_gb: float = 1.0,
     verbose: bool = False,
 ) -> str:
     """
@@ -340,7 +341,7 @@ def select_model(
     Args:
         gpu_info: GPU information or None for CPU.
         predict_spans: Whether span prediction is enabled (affects VRAM requirements).
-        safety_margin: Use only this fraction of available VRAM (default 90%).
+        vram_reserve_gb: Amount of VRAM (GB) to leave free for desktop responsiveness.
         verbose: If True, print detailed VRAM estimation breakdown.
 
     Returns:
@@ -351,9 +352,10 @@ def select_model(
             print("No GPU detected, selecting smallest model for CPU inference.")
         return "facebook/sam-audio-small"
 
-    available_vram = gpu_info.available_vram_gb * safety_margin
+    # Reserve VRAM for desktop responsiveness (absolute reserve instead of percentage)
+    available_vram = max(0, gpu_info.available_vram_gb - vram_reserve_gb)
     if verbose:
-        print(f"\nAvailable VRAM: {gpu_info.available_vram_gb:.2f} GB (using {safety_margin*100:.0f}% = {available_vram:.2f} GB)")
+        print(f"\nAvailable VRAM: {gpu_info.available_vram_gb:.2f} GB (reserving {vram_reserve_gb:.1f} GB = {available_vram:.2f} GB usable)")
 
     # Try models from largest to smallest
     for size in ["large", "base", "small"]:
@@ -480,8 +482,38 @@ Examples:
         action="store_true",
         help="Print detailed VRAM estimation breakdown during model selection.",
     )
+    parser.add_argument(
+        "--log-dir",
+        type=Path,
+        default=None,
+        help="Directory for log files. If specified, logs will be written to rotating files.",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level (default: INFO).",
+    )
+    parser.add_argument(
+        "--vram-reserve-gb",
+        type=float,
+        default=1.0,
+        help="Amount of VRAM (GB) to leave free for desktop responsiveness (default: 1.0).",
+    )
 
     args = parser.parse_args()
+
+    # Set up logging early (before any model imports)
+    from sam_audio.logging_config import setup_logging, get_logger, flush_output
+    log_level = getattr(logging, args.log_level.upper(), logging.INFO)
+    setup_logging(
+        log_dir=args.log_dir,
+        log_level=log_level,
+        enable_console=args.verbose,
+        enable_file=args.log_dir is not None,
+    )
+    logger = get_logger(__name__)
 
     # Validate input file
     if not args.input.exists():
@@ -520,6 +552,7 @@ Examples:
     model_path = args.model or select_model(
         gpu_info,
         predict_spans=args.predict_spans,
+        vram_reserve_gb=args.vram_reserve_gb,
         verbose=log_vram
     )
     if args.verbose and not log_vram:
@@ -552,6 +585,8 @@ Examples:
     # Load model and processor
     if args.verbose:
         print("Loading model...")
+    logger.info("Loading model from %s", model_path)
+    flush_output()
     model = SAMAudio.from_pretrained(model_path)
     model = model.eval()
     if device.type == "cuda":
@@ -564,26 +599,40 @@ Examples:
         print(f"Processing: {args.input}")
         print(f"Description: {args.description}")
 
+    logger.info("Preparing batch for: %s", args.input)
     batch = processor(
         audios=[str(args.input)],
         descriptions=[args.description],
     ).to(device)
+    logger.info("Batch prepared, starting separation")
+    flush_output()
 
     # Run separation
+    logger.info("Running audio separation (predict_spans=%s, candidates=%d)", args.predict_spans, candidates)
+    flush_output()
     with torch.inference_mode():
         result = model.separate(
             batch,
             predict_spans=args.predict_spans,
             reranking_candidates=candidates,
         )
+    logger.info("Separation complete")
+    flush_output()
 
-    # Save outputs
+    # Save outputs (result.target/residual are lists for batch processing)
     sample_rate = processor.audio_sampling_rate
-    torchaudio.save(str(output_target), result.target.cpu(), sample_rate)
-    torchaudio.save(str(output_residual), result.residual.cpu(), sample_rate)
+    target_audio = result.target[0] if isinstance(result.target, list) else result.target
+    residual_audio = result.residual[0] if isinstance(result.residual, list) else result.residual
+    
+    logger.info("Saving output files")
+    torchaudio.save(str(output_target), target_audio.cpu().unsqueeze(0), sample_rate)
+    torchaudio.save(str(output_residual), residual_audio.cpu().unsqueeze(0), sample_rate)
 
+    logger.info("Target saved to: %s", output_target)
+    logger.info("Residual saved to: %s", output_residual)
     print(f"Target saved to: {output_target}")
     print(f"Residual saved to: {output_residual}")
+    flush_output()
 
     return 0
 
