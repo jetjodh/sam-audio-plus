@@ -98,6 +98,51 @@ def get_gpu_info(device_index: int = 0) -> GPUInfo | None:
         except Exception:
             return None
 
+def estimate_max_audio_duration(
+    gpu_info: GPUInfo | None,
+    sample_rate: int = 48000,
+    safety_margin_gb: float = 2.5,
+) -> float:
+    """
+    Estimate maximum audio duration that can be processed without OOM.
+
+    The DAC audio encoder expands audio to 64 channels at full resolution,
+    which is the primary memory bottleneck. For example, a 265s file at 48kHz
+    requires ~3GB just for this intermediate tensor.
+
+    Memory formula: samples × 64 channels × 4 bytes (float32) = samples × 256 bytes
+
+    Args:
+        gpu_info: GPU information or None for CPU.
+        sample_rate: Audio sample rate (default 48kHz).
+        safety_margin_gb: Additional safety margin in GB for model weights, 
+                          activations, and fragmentation.
+
+    Returns:
+        Maximum audio duration in seconds. Returns float('inf') if no GPU.
+    """
+    if gpu_info is None:
+        # CPU mode - memory is typically more abundant, set high limit
+        return 600.0  # 10 minutes max for CPU
+
+    # Available VRAM for audio processing (after model weights + safety margin)
+    available_for_audio_gb = max(0.5, gpu_info.available_vram_gb - safety_margin_gb)
+
+    # DAC encoder intermediate: samples × 64 channels × 4 bytes
+    # Convert GB to bytes: available_gb × 1024³
+    # max_samples = available_bytes / (64 × 4) = available_bytes / 256
+    # We use a multiplier of 128 channels (512 bytes) to be safe and account 
+    # for additional intermediate buffers and gradients/activations
+    bytes_per_sample = 128 * 4 
+    available_bytes = available_for_audio_gb * (1024 ** 3)
+    max_samples = available_bytes / bytes_per_sample
+
+    # Convert samples to duration
+    max_duration = max_samples / sample_rate
+
+    # Cap at reasonable maximum (10 minutes)
+    return min(max_duration, 600.0)
+
 
 def estimate_model_vram(model_size: str, predict_spans: bool = True, verbose: bool = False) -> float:
     """
@@ -637,6 +682,24 @@ Examples:
         descriptions=[args.description],
     ).to(device)
     logger.info("Batch prepared, starting separation")
+    
+    # Check if audio is too long for GPU
+    # Batch audios shape: [batch_size, channels=1, samples]
+    audio_duration = batch.audios.shape[-1] / processor.audio_sampling_rate
+    max_duration = estimate_max_audio_duration(gpu_info, processor.audio_sampling_rate)
+    
+    if gpu_info and audio_duration > max_duration:
+        msg = (
+            f"\nError: Audio duration ({audio_duration:.1f}s) exceeds estimated GPU limit ({max_duration:.1f}s)\n"
+            f"Processing this file will likely cause CUDA Out Of Memory.\n\n"
+            f"Suggested fix: Split the audio into shorter segments.\n"
+            f"Try this command:\n"
+            f"  ffmpeg -i {args.input} -f segment -segment_time {int(max_duration * 0.9)} -c copy output_%03d.mp3\n"
+        )
+        print(msg)
+        logger.error("Audio too long: %.1fs > %.1fs limit", audio_duration, max_duration)
+        return 1
+
     flush_output()
 
     # Run separation

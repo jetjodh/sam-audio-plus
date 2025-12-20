@@ -314,39 +314,61 @@ def sdp_kernel_context(seq_len: Optional[int] = None, backend: Optional[str] = N
         yield
         return
     
-    # Check if context manager is available (PyTorch 2.0+)
-    if not hasattr(torch.backends.cuda, "sdp_kernel"):
-        yield
-        return
-    
-    # Configure backends based on selection
+    # Check if new SDPA kernel API is available (PyTorch 2.2+)
     try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
+        
+        backends_list = []
         if backend == "flash":
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=True,
-                enable_mem_efficient=False,
-                enable_math=False,
-            ):
-                yield
+            backends_list.append(SDPBackend.FLASH_ATTENTION)
         elif backend == "mem_efficient":
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=False,
-                enable_mem_efficient=True,
-                enable_math=False,
-            ):
-                yield
+            backends_list.append(SDPBackend.EFFICIENT_ATTENTION)
         elif backend == "math":
-            with torch.backends.cuda.sdp_kernel(
-                enable_flash=False,
-                enable_mem_efficient=False,
-                enable_math=True,
-            ):
-                yield
-        else:
+            backends_list.append(SDPBackend.MATH)
+            
+        if not backends_list:
             yield
-    except Exception:
-        # Fall back to default behavior on any error
-        yield
+            return
+            
+        try:
+            with sdpa_kernel(backends_list):
+                yield
+        except Exception:
+            yield
+        return
+
+    except ImportError:
+        # Fallback for older PyTorch versions
+        if not hasattr(torch.backends.cuda, "sdp_kernel"):
+            yield
+            return
+        
+        try:
+            if backend == "flash":
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=True,
+                    enable_mem_efficient=False,
+                    enable_math=False,
+                ):
+                    yield
+            elif backend == "mem_efficient":
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=False,
+                    enable_mem_efficient=True,
+                    enable_math=False,
+                ):
+                    yield
+            elif backend == "math":
+                with torch.backends.cuda.sdp_kernel(
+                    enable_flash=False,
+                    enable_mem_efficient=False,
+                    enable_math=True,
+                ):
+                    yield
+            else:
+                yield
+        except Exception:
+            yield
 
 
 def get_autocast_dtype(device: torch.device | None = None) -> torch.dtype | None:
@@ -362,8 +384,15 @@ def get_autocast_dtype(device: torch.device | None = None) -> torch.dtype | None
         if requested in {"fp16", "float16", "half"}:
             return torch.float16
 
-    if torch.cuda.is_bf16_supported():
-        return torch.bfloat16
+    # Only enable BF16 on Ampere+ (Compute Capability >= 8.0) to avoid "No available kernel" errors
+    # Turing (7.5) and older do not support BF16 native instructions
+    try:
+        if torch.cuda.get_device_capability(device)[0] >= 8:
+            if torch.cuda.is_bf16_supported():
+                return torch.bfloat16
+    except Exception:
+        pass
+        
     return torch.float16
 
 

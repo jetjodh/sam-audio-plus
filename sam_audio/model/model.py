@@ -247,16 +247,21 @@ class SAMAudio(BaseModel):
             # seq_len corresponds to audio codec frames, not raw samples
             in_channels = self.proj.in_features
             
-            # Create dummy noisy_audio input
+            # proj expects [noisy_audio, zeros_like(audio_features), audio_features]
+            # where noisy_audio and audio_features have the same shape
+            # So feature_dim = in_channels // 3, and both have shape [B, T, feature_dim]
+            feature_dim = in_channels // 3
+            
+            # Create dummy noisy_audio input (same shape as audio_features)
             dummy_noisy = torch.randn(
-                batch_size, seq_len, in_channels,
+                batch_size, seq_len, feature_dim,
                 device=device, dtype=dtype
             )
             
-            # Create dummy audio features (doubled as in the real forward)
-            feature_dim = in_channels // 3  # proj expects [noisy, zeros, features]
+            # Create dummy audio features (same shape as noisy_audio, but in real code
+            # audio_features is stacked [features, features] so with dim=feature_dim)
             dummy_features = torch.randn(
-                batch_size, seq_len, feature_dim * 2,
+                batch_size, seq_len, feature_dim,
                 device=device, dtype=dtype
             )
             
@@ -275,7 +280,7 @@ class SAMAudio(BaseModel):
             for _ in range(2):  # 2 warmup passes
                 with autocast_context(device=device):
                     aligned = self.align_inputs(
-                        dummy_noisy[:, :, :feature_dim * 2],
+                        dummy_noisy,
                         dummy_features,
                         masked_video_features=dummy_video,
                     )
