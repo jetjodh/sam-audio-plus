@@ -38,7 +38,8 @@ warnings.filterwarnings("ignore", message="Not enough SMs to use max_autotune_ge
 # 3. CUDAGraph fast path warning during warmup before inference_mode is active
 warnings.filterwarnings("ignore", category=UserWarning, message="Unable to hit fast path of CUDAGraphs")
 # 4. Online softmax warning from torch._inductor when splitting reduction
-warnings.filterwarnings("ignore", category=UserWarning, message="Online softmax is disabled")
+# Note: PyTorch's warning starts with a newline, so we use regex to match
+warnings.filterwarnings("ignore", category=UserWarning, message=r"^\s*Online softmax is disabled")
 # 5. RobertaModel pooler weights re-initialization (expected for CLAP)
 warnings.filterwarnings("ignore", message=".*RobertaModel.*not initialized.*")
 
@@ -529,6 +530,11 @@ Examples:
         help="Number of reranking candidates. Auto-adjusted based on GPU if not specified.",
     )
     parser.add_argument(
+        "--skip-ranker",
+        action="store_true",
+        help="Skip the ranker model (forces candidates=1). Useful for low-VRAM GPUs.",
+    )
+    parser.add_argument(
         "--device",
         type=str,
         default=None,
@@ -663,8 +669,13 @@ Examples:
     if args.verbose and not log_vram:
         print(f"Using model: {model_path}")
 
-    # Select reranking candidates
-    candidates = args.candidates or select_reranking_candidates(gpu_info)
+    # Select reranking candidates (skip-ranker forces 1)
+    if args.skip_ranker:
+        candidates = 1
+        if args.verbose:
+            print("Ranker disabled (--skip-ranker)")
+    else:
+        candidates = args.candidates or select_reranking_candidates(gpu_info)
     if args.verbose:
         print(f"Reranking candidates: {candidates}")
         print(f"Span prediction: {args.predict_spans}")
@@ -766,6 +777,11 @@ Examples:
     residual_audio = result.residual[0] if isinstance(result.residual, list) else result.residual
     
     logger.info("Saving output files")
+    
+    # Ensure output directories exist
+    output_target.parent.mkdir(parents=True, exist_ok=True)
+    output_residual.parent.mkdir(parents=True, exist_ok=True)
+    
     torchaudio.save(str(output_target), target_audio.cpu().unsqueeze(0), sample_rate)
     torchaudio.save(str(output_residual), residual_audio.cpu().unsqueeze(0), sample_rate)
 
