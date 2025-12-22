@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, Optional, Literal
 
 import torch
-from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
 from torchdiffeq import odeint
 
 from sam_audio.runtime import (
@@ -151,6 +150,8 @@ class SAMAudio(BaseModel):
         if self._span_predictor_cfg is None:
             return None
         if self.span_predictor is None:
+            # Lazy import to avoid OOM at module load time
+            from core.audio_visual_encoder import PEAudioFrame, PEAudioFrameTransform
             self.span_predictor = PEAudioFrame.from_config(
                 self._span_predictor_cfg, pretrained=True
             )

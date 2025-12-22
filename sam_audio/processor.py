@@ -12,7 +12,6 @@ import torch
 import torchaudio
 from huggingface_hub import hf_hub_download
 from torch.nn.utils.rnn import pad_sequence
-from torchcodec.decoders import AudioDecoder, VideoDecoder
 from transformers import AutoTokenizer, BatchFeature
 
 from sam_audio.logging_config import flush_output, get_logger
@@ -32,6 +31,8 @@ def _load_single_audio(
 ) -> torch.Tensor:
     """Load a single audio file or return tensor."""
     if isinstance(audio, str):
+        # Lazy import to avoid OOM at module load time
+        from torchcodec.decoders import AudioDecoder
         decoder = AudioDecoder(
             audio,
             sample_rate=audio_sampling_rate,
@@ -183,6 +184,8 @@ def load_video(
     feature_idx_to_wav_idx: Callable[[torch.Tensor], torch.Tensor],
     audio_sampling_rate: int,
 ) -> list[torch.Tensor]:
+    # Lazy import to avoid OOM at module load time
+    from torchcodec.decoders import VideoDecoder
     all_frames = []
     for size, video in zip(sizes, videos, strict=False):
         audio_timestamps = (
@@ -264,6 +267,8 @@ class Processor:
         videos: List[str | torch.Tensor],
         masks: List[str | torch.Tensor],
     ) -> list[torch.Tensor]:
+        # Lazy import to avoid OOM at module load time
+        from torchcodec.decoders import VideoDecoder
         video = [VideoDecoder(v)[:] if isinstance(v, str)
                  else v for v in videos]
         video_mask = [VideoDecoder(v)[:] if isinstance(
@@ -360,6 +365,8 @@ class SAMAudioJudgeProcessor(Processor):
         return torch.nn.functional.pad(wav, p1d, mode="reflect")
 
     def _load_audio(self, path: str):
+        # Lazy import to avoid OOM at module load time
+        from torchcodec.decoders import AudioDecoder
         ad = AudioDecoder(
             path, sample_rate=self.audio_sampling_rate, num_channels=1)
         return ad.get_all_samples().data
