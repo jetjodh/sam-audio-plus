@@ -1,10 +1,13 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved\n
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, TYPE_CHECKING
 
 import numpy as np
-from core.audio_visual_encoder.config import TransformerConfig as PEAVTransformerConfig
 from transformers import ModernBertConfig
+
+# Lazy import to avoid OOM at module load time
+if TYPE_CHECKING:
+    from core.audio_visual_encoder.config import TransformerConfig as PEAVTransformerConfig
 
 
 class DACVAEConfig:
@@ -248,12 +251,14 @@ class SAMAudioJudgeConfig:
     def __init__(
         self,
         audio_codec: DACVAEConfig = None,
-        transformer: PEAVTransformerConfig = None,
+        transformer: "PEAVTransformerConfig" = None,
         text_model: ModernBertConfig = None,
-        finetune_transformer: PEAVTransformerConfig = None,
+        finetune_transformer: "PEAVTransformerConfig" = None,
         nth_text_layer: int = 22,
         bottleneck_dim: int = 256,
     ):
+        # Lazy import to avoid OOM at module load time
+        from core.audio_visual_encoder.config import TransformerConfig as PEAVTransformerConfig
         self.audio_codec = DACVAEConfig(**(audio_codec or {}))
         self.transformer = PEAVTransformerConfig(**(transformer or {}))
         self.text_model = ModernBertConfig(**(text_model or {}))

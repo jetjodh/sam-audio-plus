@@ -4,7 +4,6 @@ from abc import ABCMeta, abstractmethod
 
 import torch
 import torchvision
-from core.vision_encoder import pe
 from torch.nn.utils.rnn import pad_sequence
 
 from sam_audio.model.config import (
@@ -83,6 +82,8 @@ class PerceptionEncoder(VisionEncoder):
         self.interpolation_mode = cfg.interpolation_mode
         self.image_size = cfg.image_size
         super().__init__(cfg)
+        # Lazy import to avoid OOM at module load time
+        from core.vision_encoder import pe
         self.model = pe.CLIP.from_config(cfg.name)
 
     def encode(self, x):

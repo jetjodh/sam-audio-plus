@@ -557,6 +557,8 @@ class SAMAudio(BaseModel):
             )
 
         # Clear ODE intermediates before decoding (task-12)
+        # Save noise reference before deleting for return value
+        noise_out = noise
         if device.type == "cuda":
             del forward_args, noise
             clear_cuda_cache(log=False)
@@ -605,7 +607,7 @@ class SAMAudio(BaseModel):
                 )
                 idxs = scores.argmax(dim=1)
             else:
-                idxs = torch.zeros(bsz, dtype=torch.long, device=noise.device)
+                idxs = torch.zeros(bsz, dtype=torch.long, device=device)
 
         log_memory("post_inference_vram", device)
 
@@ -615,7 +617,7 @@ class SAMAudio(BaseModel):
             residual=[
                 wavs[idx] for wavs, idx in zip(residual_wavs, idxs, strict=False)
             ],
-            noise=noise,
+            noise=noise_out,
         )
 
     def unbatch(self, wavs: torch.Tensor, sizes: torch.Tensor, time_dim: int = -1):
