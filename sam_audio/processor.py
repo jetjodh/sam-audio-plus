@@ -175,7 +175,7 @@ class Batch:
 
 
 def mask_from_sizes(sizes: torch.Tensor) -> torch.Tensor:
-    return torch.arange(sizes.max()).expand(len(sizes), -1) < sizes.unsqueeze(1)
+    return torch.arange(sizes.max(), device=sizes.device).expand(len(sizes), -1) < sizes.unsqueeze(1)
 
 
 def load_video(
