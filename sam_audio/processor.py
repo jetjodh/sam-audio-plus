@@ -201,8 +201,9 @@ def load_video(
             assert video.size(1) == 3, (
                 f"Expected video tensor to be in NCHW format, but found {video.size(1)} channels"
             )
+            # Create index on the same device as video to avoid CPU-CUDA transfers
             idx = torch.linspace(0, video.size(
-                0) - 1, int(size)).round().long()
+                0) - 1, int(size), device=video.device).round().long()
             frames = video[idx]
         all_frames.append(frames)
     return all_frames
