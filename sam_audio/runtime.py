@@ -329,6 +329,8 @@ def sdp_kernel_context(seq_len: Optional[int] = None, backend: Optional[str] = N
     except ImportError:
         pass
 
+    selected_ctx = None
+
     if sdpa_kernel is not None and SDPBackend is not None:
         backends_list = []
         if backend == "flash":
@@ -340,53 +342,44 @@ def sdp_kernel_context(seq_len: Optional[int] = None, backend: Optional[str] = N
 
         if backends_list:
             try:
-                with sdpa_kernel(backends_list):
-                    yield
-                return
+                selected_ctx = sdpa_kernel(backends_list)
             except Exception:
-                # Kernel selection failed, fall through to default behavior
+                # Kernel selection failed, will fall through to legacy or no-op
                 pass
 
-        # No valid backend or kernel selection failed
-        yield
-        return
-
     # Fallback for older PyTorch versions
-    if not hasattr(torch.backends.cuda, "sdp_kernel"):
-        yield
-        return
+    if selected_ctx is None and hasattr(torch.backends.cuda, "sdp_kernel"):
+        if backend == "flash":
+            try:
+                selected_ctx = torch.backends.cuda.sdp_kernel(
+                    enable_flash=True,
+                    enable_mem_efficient=False,
+                    enable_math=False,
+                )
+            except Exception:
+                pass
+        elif backend == "mem_efficient":
+            try:
+                selected_ctx = torch.backends.cuda.sdp_kernel(
+                    enable_flash=False,
+                    enable_mem_efficient=True,
+                    enable_math=False,
+                )
+            except Exception:
+                pass
+        elif backend == "math":
+            try:
+                selected_ctx = torch.backends.cuda.sdp_kernel(
+                    enable_flash=False,
+                    enable_mem_efficient=False,
+                    enable_math=True,
+                )
+            except Exception:
+                pass
 
-    ctx = None
-    if backend == "flash":
-        try:
-            ctx = torch.backends.cuda.sdp_kernel(
-                enable_flash=True,
-                enable_mem_efficient=False,
-                enable_math=False,
-            )
-        except Exception:
-            pass
-    elif backend == "mem_efficient":
-        try:
-            ctx = torch.backends.cuda.sdp_kernel(
-                enable_flash=False,
-                enable_mem_efficient=True,
-                enable_math=False,
-            )
-        except Exception:
-            pass
-    elif backend == "math":
-        try:
-            ctx = torch.backends.cuda.sdp_kernel(
-                enable_flash=False,
-                enable_mem_efficient=False,
-                enable_math=True,
-            )
-        except Exception:
-            pass
-
-    if ctx is not None:
-        with ctx:
+    # Use selected context or yield without context
+    if selected_ctx is not None:
+        with selected_ctx:
             yield
     else:
         yield
