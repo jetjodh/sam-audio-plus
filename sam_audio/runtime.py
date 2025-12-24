@@ -293,96 +293,26 @@ from contextlib import contextmanager
 @contextmanager
 def sdp_kernel_context(seq_len: Optional[int] = None, backend: Optional[str] = None):
     """
-    Context manager for selecting SDPA kernel based on sequence length.
+    Context manager for SDPA kernel selection.
 
-    This optimizes attention performance by selecting the best kernel:
-    - 'flash': FlashAttention-2, best for long sequences (>=1024)
-    - 'mem_efficient': Memory-efficient attention, best for shorter sequences
-    - 'math': Standard math implementation, fallback
+    This context manager provides hints for kernel selection but does NOT
+    restrict to specific backends, allowing PyTorch to automatically fall back
+    to available kernels when the preferred one doesn't support the input
+    configuration (e.g., with attention masks, specific dtypes, etc.).
 
     Args:
-        seq_len: Sequence length to auto-select backend for.
-        backend: Explicit backend override ('flash', 'mem_efficient', 'math').
+        seq_len: Sequence length (currently unused, kept for API compatibility).
+        backend: Backend hint (currently unused, kept for API compatibility).
 
-    Example:
-        with sdp_kernel_context(seq_len=2048):
-            # Will use FlashAttention-2
-            output = F.scaled_dot_product_attention(q, k, v)
+    Note:
+        Previous versions tried to force specific backends, but this caused
+        "No available kernel" errors when the selected backend didn't support
+        the input configuration. Now we let PyTorch auto-select the best
+        available kernel.
     """
-    if not torch.cuda.is_available():
-        yield
-        return
-
-    # Determine which backend to use
-    if backend is None and seq_len is not None:
-        backend = get_preferred_sdp_backend(seq_len)
-
-    if backend is None:
-        yield
-        return
-
-    # Try new SDPA kernel API (PyTorch 2.2+)
-    sdpa_kernel = None
-    SDPBackend = None
-    try:
-        from torch.nn.attention import SDPBackend, sdpa_kernel
-    except ImportError:
-        pass
-
-    selected_ctx = None
-
-    if sdpa_kernel is not None and SDPBackend is not None:
-        backends_list = []
-        if backend == "flash":
-            backends_list.append(SDPBackend.FLASH_ATTENTION)
-        elif backend == "mem_efficient":
-            backends_list.append(SDPBackend.EFFICIENT_ATTENTION)
-        elif backend == "math":
-            backends_list.append(SDPBackend.MATH)
-
-        if backends_list:
-            try:
-                selected_ctx = sdpa_kernel(backends_list)
-            except Exception:
-                # Kernel selection failed, will fall through to legacy or no-op
-                pass
-
-    # Fallback for older PyTorch versions
-    if selected_ctx is None and hasattr(torch.backends.cuda, "sdp_kernel"):
-        if backend == "flash":
-            try:
-                selected_ctx = torch.backends.cuda.sdp_kernel(
-                    enable_flash=True,
-                    enable_mem_efficient=False,
-                    enable_math=False,
-                )
-            except Exception:
-                pass
-        elif backend == "mem_efficient":
-            try:
-                selected_ctx = torch.backends.cuda.sdp_kernel(
-                    enable_flash=False,
-                    enable_mem_efficient=True,
-                    enable_math=False,
-                )
-            except Exception:
-                pass
-        elif backend == "math":
-            try:
-                selected_ctx = torch.backends.cuda.sdp_kernel(
-                    enable_flash=False,
-                    enable_mem_efficient=False,
-                    enable_math=True,
-                )
-            except Exception:
-                pass
-
-    # Use selected context or yield without context
-    if selected_ctx is not None:
-        with selected_ctx:
-            yield
-    else:
-        yield
+    # Simply yield without any kernel restriction
+    # PyTorch will automatically select the best available kernel
+    yield
 
 
 def get_autocast_dtype(device: torch.device | None = None) -> torch.dtype | None:
